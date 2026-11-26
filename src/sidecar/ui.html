@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex 会话</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f4; --panel: #ffffff; --text: #182522; --muted: #586960;
+    --line: #d8e1dc; --accent: #076553; --accent-bg: #dcf2e9;
+    --attention: #804a00; --attention-bg: #fff0d8;
+    --success: #246329; --success-bg: #e2f1df;
+    --failure: #a12536; --failure-bg: #fbe5e9;
+    --radius: 12px;
+    font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141a18; --panel: #1d2522; --text: #edf4f0; --muted: #a9bbb3;
+      --line: #394942; --accent: #80dfc5; --accent-bg: #233f37;
+      --attention: #ffd291; --attention-bg: #49341e;
+      --success: #a2e39a; --success-bg: #29412a;
+      --failure: #ffadb8; --failure-bg: #482b32;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-width: 220px; background: var(--bg); color: var(--text); font-size: 13px; }
+  main { max-width: 680px; margin: 0 auto; padding: 16px; }
+  header, .group-head, .card-head, .toolbar, .actions { display: flex; align-items: center; gap: 8px; }
+  header, .group-head, .card-head { justify-content: space-between; }
+  header { align-items: flex-start; }
+  h1 { font-size: 21px; margin: 2px 0 6px; letter-spacing: -.025em; }
+  h2 { font-size: 14px; margin: 0; }
+  h3 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+  p { margin: 0; }
+  .muted, .workspace, .count { color: var(--muted); }
+  .workspace { margin: 8px 0; font-size: 11px; overflow-wrap: anywhere; }
+  .usage { display: flex; gap: 7px; align-items: center; }
+  .quota { text-align: center; font-size: 10px; color: var(--muted); min-width: 33px; }
+  .ring { display: grid; place-items: center; width: 33px; height: 33px; border-radius: 50%;
+    background: conic-gradient(var(--accent) var(--fill, 0%), var(--line) 0); margin-bottom: 2px; }
+  .ring span { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 50%;
+    background: var(--bg); color: var(--text); font-size: 10px; font-weight: 650; }
+  .toolbar { margin: 14px 0 2px; flex-wrap: wrap; }
+  .search-bar { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .search-bar input { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; }
+  .search-bar input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .search-bar button { font-size: 11px; }
+  button { font: inherit; cursor: pointer; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 7px; padding: 5px 8px; white-space: nowrap; }
+  button:hover, button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+  button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { cursor: wait; opacity: .65; }
+  .primary { background: var(--accent-bg); border-color: transparent; color: var(--accent); font-weight: 650; }
+  .group { margin-top: 20px; }
+  .group-head { padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  .count { font-size: 11px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); margin-top: 8px; padding: 10px; }
+  .card.attention { border-color: var(--attention); }
+  .badge { flex: none; padding: 3px 7px; border-radius: 20px; background: var(--bg); color: var(--muted); font-size: 10px; font-weight: 650; }
+  .badge.active { color: var(--accent); background: var(--accent-bg); }
+  .badge.waiting_approval { color: var(--attention); background: var(--attention-bg); }
+  .badge.completed { color: var(--success); background: var(--success-bg); }
+  .badge.failed { color: var(--failure); background: var(--failure-bg); }
+  .actions { flex-wrap: wrap; }
+  .actions button { font-size: 11px; }
+  .auto-read-controls { display: inline-flex; align-items: center; gap: 5px; }
+  .auto-read-limit { width: 45px; padding: 4px; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 5px; font: inherit; }
+  .auto-read-error { margin-top: 6px; color: var(--failure); font-size: 11px; }
+  .summary { display: grid; gap: 6px; padding: 9px 0 0; border-top: 1px solid var(--line); margin-top: 9px; }
+  .message { overflow-wrap: anywhere; max-height: 210px; overflow-y: auto; }
+  .message > :first-child { margin-top: 0; }
+  .message > :last-child { margin-bottom: 0; }
+  .message p, .message ul, .message ol, .message blockquote, .message pre, .md-table { margin: 6px 0; }
+  .message h1, .message h2, .message h3, .message h4 { margin: 10px 0 5px; font-size: 1em; }
+  .message h1, .message h2 { font-size: 1.1em; }
+  .message ul, .message ol { padding-inline-start: 20px; }
+  .message blockquote { padding-inline-start: 8px; border-inline-start: 2px solid var(--line); color: var(--muted); }
+  .message hr { border: 0; border-top: 1px solid var(--line); margin: 9px 0; }
+  .message code { font: .92em Consolas, "Cascadia Code", monospace; background: var(--bg); border-radius: 3px; padding: 1px 3px; }
+  .message pre { overflow-x: auto; max-width: 100%; padding: 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); }
+  .message pre code { white-space: pre; padding: 0; }
+  .message a { color: var(--accent); text-decoration: underline; }
+  .md-table { overflow-x: auto; max-width: 100%; }
+  .md-table table { border-collapse: collapse; }
+  .md-table th, .md-table td { padding: 4px 7px; border: 1px solid var(--line); text-align: start; }
+  .md-table th { background: var(--bg); }
+  .summary > strong { font-size: 11px; color: var(--muted); }
+  .empty, details { padding: 10px 0 0; color: var(--muted); }
+  summary { cursor: pointer; }
+  #feedback { font-size: 11px; min-height: 1.4em; margin-top: 6px; }
+  @media (max-width: 300px) { main { padding: 11px; } .card-head { align-items: flex-start; flex-direction: column; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>Codex 会话</h1><p id="synced" class="muted">等待首次同步</p></div>
+    <div class="usage" id="usage" aria-label="Codex 剩余额度"></div>
+  </header>
+  <div class="toolbar">
+    <button id="refresh" class="primary">刷新</button>
+    <button id="pause" aria-pressed="false">暂停心跳</button>
+    <button id="notifications" aria-pressed="false">桌面通知</button>
+  </div>
+  <div class="search-bar">
+    <input id="search" type="search" placeholder="模糊搜索标题 / 工作区 / ID…" autocomplete="off" aria-label="模糊搜索会话">
+    <button id="clear-search" type="button" hidden>清空</button>
+  </div>
+  <p id="feedback" class="muted" aria-live="polite"></p>
+  <div id="targets"></div>
+</main>
+<script>
+  const targets = ['101-codex', 'win-codex', '101-dsh', 'win-dsh'];
+  const labels = {
+    waiting_approval: '等待原窗口审批', active: '运行中', completed: '已完成', failed: '失败',
+    idle: '空闲', unloaded: '未加载', offline: '离线', paused: '暂停', unknown: '待确认', interrupted: '已中断'
+  };
+  const byId = id => document.getElementById(id);
+  const token = new URLSearchParams(location.search).get('token') || window.sidecar?.token || '';
+  const summaries = new Map();
+  const drawers = new Set();
+  let state;
+  let renderedSnapshot;
+  let focusInFlight;
+  let lastFeedback;
+  let searchQuery = '';
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  function appendMarkdownInline(parent, text) {
+    const tokens = /(`[^`\n]+`)|\[([^\]\n]+)\]\(((?:[^\s()]|\([^\s()]*\))+)\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|<[^>\n]*>/g;
+    let start = 0;
+    for (const match of text.matchAll(tokens)) {
+      if (match.index > start) parent.append(el('span', '', text.slice(start, match.index)));
+      const [raw, code, label, link, strong, emphasis] = match;
+      if (code) parent.append(el('code', '', code.slice(1, -1)));
+      else if (link) {
+        let url;
+        try { url = new URL(link); } catch { /* use literal text */ }
+        if (url && ['http:', 'https:'].includes(url.protocol)) {
+          const anchor = el('a', '', label);
+          anchor.href = url.href;
+          anchor.target = '_blank';
+          anchor.rel = 'noopener noreferrer';
+          parent.append(anchor);
+        } else parent.append(el('span', '', raw));
+      } else if (strong) parent.append(el('strong', '', strong));
+      else if (emphasis) parent.append(el('em', '', emphasis));
+      else parent.append(el('span', '', raw));
+      start = match.index + raw.length;
+    }
+    if (start < text.length) parent.append(el('span', '', text.slice(start)));
+  }
+
+  function renderMarkdown(text) {
+    const content = el('div', 'message');
+    const lines = text.replace(/\r\n?/g, '\n').split('\n');
+    const heading = /^(#{1,4})\s+(.+)$/;
+    const fence = /^(`{3,})[\w+.#-]*\s*$/;
+    const list = /^([-*]|\d+\.)\s+(.+)$/;
+    const rule = /^-{3,}$/;
+    const cells = line => line.replace(/^\||\|$/g, '').split('|').map(cell => cell.trim());
+    const tableAt = i => lines[i]?.trim().includes('|') && lines[i + 1]?.trim().includes('|')
+      && cells(lines[i + 1].trim()).length === cells(lines[i].trim()).length
+      && cells(lines[i + 1].trim()).every(cell => /^:?-{3,}:?$/.test(cell));
+    const inline = (tag, value) => {
+      const node = el(tag);
+      appendMarkdownInline(node, value);
+      return node;
+    };
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i].trim();
+      if (!line) { i++; continue; }
+      const mark = line.match(fence);
+      const title = line.match(heading);
+      const item = line.match(list);
+      if (mark) {
+        const code = [];
+        i++;
+        while (i < lines.length) {
+          const closer = lines[i].trim();
+          if (/^`{3,}$/.test(closer) && closer.length >= mark[1].length) break;
+          code.push(lines[i++]);
+        }
+        if (i < lines.length) i++;
+        const pre = el('pre');
+        pre.append(el('code', '', code.join('\n')));
+        content.append(pre);
+      } else if (title) {
+        content.append(inline('h' + title[1].length, title[2]));
+        i++;
+      } else if (rule.test(line)) {
+        content.append(el('hr'));
+        i++;
+      } else if (line.startsWith('> ')) {
+        const quote = [];
+        while (i < lines.length && lines[i].trim().startsWith('> ')) quote.push(lines[i++].trim().slice(2));
+        content.append(inline('blockquote', quote.join(' ')));
+      } else if (item) {
+        const ordered = /^\d/.test(item[1]);
+        const node = el(ordered ? 'ol' : 'ul');
+        if (ordered) {
+          const start = Number.parseInt(item[1], 10);
+          if (Number.isSafeInteger(start) && start !== 1) node.start = start;
+        }
+        while (i < lines.length) {
+          const next = lines[i].trim().match(list);
+          if (!next || /^\d/.test(next[1]) !== ordered) break;
+          node.append(inline('li', next[2]));
+          i++;
+        }
+        content.append(node);
+      } else if (tableAt(i)) {
+        const headers = cells(line);
+        const container = el('div', 'md-table');
+        const table = el('table');
+        const head = el('thead');
+        const titles = el('tr');
+        headers.forEach(text => titles.append(inline('th', text)));
+        head.append(titles);
+        const body = el('tbody');
+        i += 2;
+        while (i < lines.length && lines[i].trim().includes('|')) {
+          const columns = cells(lines[i++].trim());
+          const row = el('tr');
+          headers.forEach((_, index) => row.append(inline('td', columns[index] ?? '')));
+          body.append(row);
+        }
+        table.append(head, body);
+        container.append(table);
+        content.append(container);
+      } else {
+        const paragraph = [line];
+        i++;
+        while (i < lines.length) {
+          const next = lines[i].trim();
+          if (!next || heading.test(next) || fence.test(next) || rule.test(next) || list.test(next)
+              || next.startsWith('> ') || tableAt(i)) break;
+          paragraph.push(next);
+          i++;
+        }
+        content.append(inline('p', paragraph.join(' ')));
+      }
+    }
+    return content;
+  }
+
+  async function request(path, body) {
+    const headers = token ? { 'X-Sidecar-Token': token } : {};
+    const options = { headers, redirect: 'error', cache: 'no-store' };
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      options.method = 'POST';
+      options.body = JSON.stringify(body);
+    }
+    const response = await (window.sidecar?.fetch || fetch)(path, options);
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.message || 'HTTP ' + response.status);
+    }
+    return response.json();
+  }
+
+  function feedback(message) {
+    clearTimeout(lastFeedback);
+    byId('feedback').textContent = message;
+    lastFeedback = setTimeout(() => { byId('feedback').textContent = ''; }, 4500);
+  }
+
+  function update(next) {
+    state = next;
+    const fingerprint = JSON.stringify([next.sampledAt, next.prefs, next.targets]);
+    if (fingerprint === renderedSnapshot) return;
+    renderedSnapshot = fingerprint;
+    render();
+  }
+
+  async function setPrefs(value) {
+    try { update(await request('/api/prefs', value)); return true; }
+    catch (error) {
+      feedback(!error.message || /^HTTP /.test(error.message) ? '设置未保存，请重试' : error.message);
+      return false;
+    }
+  }
+
+  async function refresh(reason) {
+    try {
+      const next = await request('/api/refresh?reason=' + reason, {});
+      update(next);
+      if (reason === 'manual') feedback(next.error ? '同步失败，请重试' : '同步完成');
+    } catch { feedback('侧栏连接失败，请重试'); }
+  }
+
+  async function copyReference(row) {
+    const text = JSON.stringify({ target: row.target, sessionId: row.sessionId, expectedWorkspace: row.workspacePath,
+      ...(row.activeTurnId && { expectedTurnId: row.activeTurnId }) });
+    try { await navigator.clipboard.writeText(text); feedback('已复制会话引用'); }
+    catch {
+      const input = el('textarea', '', text);
+      input.setAttribute('readonly', '');
+      document.body.append(input);
+      input.select();
+      const copied = document.execCommand('copy');
+      input.remove();
+      feedback(copied ? '已复制会话引用' : '无法访问剪贴板');
+    }
+  }
+
+  async function toggleSummary(row, key) {
+    if (summaries.has(key)) { summaries.delete(key); render(); return; }
+    const box = { pending: true };
+    summaries.set(key, box);
+    render();
+    const params = new URLSearchParams({ target: row.target, sessionId: row.sessionId });
+    try {
+      const result = await request('/api/summary?' + params);
+      Object.assign(box, result, { pending: false });
+      update(await request('/api/state'));
+      render();
+    } catch {
+      Object.assign(box, { pending: false, failed: true });
+      render();
+    }
+  }
+
+  function button(text, handler, pressed) {
+    const node = el('button', null, text);
+    if (pressed !== undefined) node.setAttribute('aria-pressed', String(pressed));
+    node.addEventListener('click', handler);
+    return node;
+  }
+
+  function autoReadControls(preference, change) {
+    const enabled = preference.autoRead === true;
+    const limit = preference.autoReadLimit ?? state.maxAutoReads;
+    const controls = el('span', 'auto-read-controls');
+    const toggle = button(enabled ? '自动读取 ' + (preference.autoReadCount ?? 0) + '/' + limit : '自动读取', () => {
+      const conversationId = window.sidecar?.conversationId ?? new URLSearchParams(location.search).get('conversationId') ?? '';
+      const projectId = window.sidecar?.projectId ?? '';
+      void change({ autoRead: !enabled, ...(!enabled && { conversationId, projectId }) });
+    }, enabled);
+    if (preference.autoReadConversationId) toggle.title = '绑定对话 ' + preference.autoReadConversationId.slice(0, 8);
+    controls.append(toggle);
+    if (enabled) {
+      const input = el('input', 'auto-read-limit');
+      Object.assign(input, { type: 'number', min: '1', max: '20', step: '1', value: String(limit), title: '跟进轮数上限（1–20）' });
+      input.setAttribute('aria-label', '跟进轮数上限');
+      input.addEventListener('change', async () => {
+        if (!await change({ autoReadLimit: Number(input.value) })) input.value = String(limit);
+      });
+      controls.append(input);
+    }
+    return controls;
+  }
+
+  function card(row, reachable, preferences, isMonitored = true) {
+    const key = row.target + ':' + row.sessionId;
+    const pref = preferences[key] || {};
+    const baseCode = !reachable ? 'offline' : ['active', 'waiting_approval'].includes(row.state) ? row.state : row.outcome || row.state;
+    const code = reachable && !isMonitored && !row.outcome && baseCode === 'unknown' ? 'unloaded' : baseCode;
+    const node = el('article', 'card' + (code === 'waiting_approval' ? ' attention' : ''));
+    const head = el('div', 'card-head');
+    const title = el('h3', '', row.title || row.sessionId);
+    const badge = el('span', 'badge ' + code, (labels[code] || labels.unknown) + (row.unread ? ' · 未读' : ''));
+    head.append(title, badge);
+    node.append(head);
+    if (row.workspacePath) node.append(el('p', 'workspace', row.workspacePath));
+    const options = el('div', 'actions');
+    const change = values => setPrefs({ target: row.target, sessionId: row.sessionId, ...values });
+    options.append(button(pref.starred ? '★ 已星标' : '☆ 星标', () => change({ starred: !pref.starred }), !!pref.starred),
+      button(pref.hidden ? '恢复显示' : '隐藏', () => change({ hidden: !pref.hidden })),
+      button('复制引用', () => copyReference(row)),
+      button(summaries.has(key) ? '收起摘要' : '最近一轮', () => toggleSummary(row, key), summaries.has(key)),
+      autoReadControls(pref, change));
+    node.append(options);
+    if (pref.autoReadError) node.append(el('p', 'auto-read-error', pref.autoReadError));
+    if (summaries.has(key)) {
+      const result = summaries.get(key);
+      const detail = el('div', 'summary');
+      if (result.pending || result.failed || !result.messages?.length) {
+        detail.append(el('p', 'muted', result.pending ? '读取中…' : result.failed ? '读取失败，收起后可重试' : '本轮暂无公开问答'));
+      } else {
+        for (const message of result.messages) {
+          detail.append(el('strong', '', message.role === 'user' ? '用户' : '会话回复'), renderMarkdown(message.text));
+        }
+        if (result.truncated) detail.append(el('p', 'muted', '部分内容已截取'));
+      }
+      node.append(detail);
+    }
+    return node;
+  }
+
+  function groupSessions(info, pref, query = '') {
+    const monitored = new Map(info.sessions.map(row => [row.sessionId, row]));
+    const rows = new Map(monitored);
+    for (const row of info.catalog?.sessions ?? []) {
+      if (!rows.has(row.sessionId)) rows.set(row.sessionId, row);
+    }
+    const rank = row => (row.state === 'waiting_approval' ? 8 : 0) + (row.state === 'active' ? 4 : 0)
+      + (row.unread ? 2 : 0) + (pref(row).starred || pref(row).autoRead ? 1 : 0);
+    const sorted = [...rows.values()].sort((a, b) => rank(b) - rank(a)
+      || (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
+    const filtering = Boolean(String(query || '').trim());
+    const filtered = filtering ? sorted.filter(row => matchesQuery(row, query)) : sorted;
+    const visible = [];
+    const recent = [];
+    const hidden = [];
+    for (const row of filtered) {
+      if (pref(row).hidden) hidden.push(row);
+      else if (filtering || rank(row) || monitored.has(row.sessionId)) visible.push(row);
+      else recent.push(row);
+    }
+    return {
+      total: rows.size, matched: filtered.length, monitored,
+      visible, recent: recent.slice(0, 20), recentCount: recent.length, hidden
+    };
+  }
+
+  function matchesQuery(row, query) {
+    const terms = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!terms.length) return true;
+    const haystack = [row.title, row.workspacePath, row.sessionId].filter(Boolean).join(' ').toLowerCase();
+    return terms.every(term => {
+      if (haystack.includes(term)) return true;
+      let index = 0;
+      for (const ch of haystack) {
+        if (ch === term[index] && ++index === term.length) return true;
+      }
+      return false;
+    });
+  }
+
+  function sessionDrawer(key, label, rows, reachable, preferences, monitored) {
+    const drawer = el('details');
+    drawer.open = drawers.has(key);
+    drawer.addEventListener('toggle', () => { if (drawer.open) drawers.add(key); else drawers.delete(key); });
+    drawer.append(el('summary', '', label));
+    rows.forEach(row => drawer.append(card(row, reachable, preferences, monitored ? monitored.has(row.sessionId) : true)));
+    return drawer;
+  }
+
+  function render() {
+    if (!state) return;
+    const { prefs } = state;
+    byId('pause').textContent = prefs.paused ? '恢复心跳' : '暂停心跳';
+    byId('pause').setAttribute('aria-pressed', String(prefs.paused));
+    byId('notifications').setAttribute('aria-pressed', String(prefs.notifications));
+    byId('synced').textContent = state.sampledAt ? '同步于 ' + new Date(state.sampledAt).toLocaleTimeString() : '等待首次同步';
+    const quota = byId('usage');
+    quota.replaceChildren();
+    const limits = state.targets['101-codex'].rateLimits || state.targets['win-codex'].rateLimits;
+    for (const period of ['5h', '7d']) {
+      const value = limits?.windows?.[period]?.remainingPercent;
+      const item = el('div', 'quota');
+      const ring = el('div', 'ring');
+      ring.style.setProperty('--fill', (value ?? 0) + '%');
+      ring.append(el('span', '', Number.isFinite(value) ? Math.round(value) + '%' : '—'));
+      item.append(ring, el('span', '', period));
+      quota.append(item);
+    }
+    const root = byId('targets');
+    root.replaceChildren();
+    for (const target of targets) {
+      const info = state.targets[target];
+      if (!info) continue;
+      const pref = row => prefs.sessions[target + ':' + row.sessionId] || {};
+      const { total, matched, monitored, visible, recent, recentCount, hidden } = groupSessions(info, pref, searchQuery);
+      const filtering = Boolean(searchQuery.trim());
+      const group = el('section', 'group');
+      const heading = el('div', 'group-head');
+      const countText = !info.reachable ? (info.sampledAt ? '离线' : '待同步')
+        : filtering ? '匹配 ' + matched + ' / ' + total : total + ' 个会话';
+      heading.append(el('h2', '', target), el('span', 'count', countText));
+      group.append(heading);
+      visible.forEach(row => group.append(card(row, info.reachable, prefs.sessions, monitored.has(row.sessionId))));
+      if (!total) group.append(el('p', 'empty', info.error?.message || '暂无会话'));
+      else if (filtering && !matched) group.append(el('p', 'empty', '未找到匹配会话'));
+      if (recent.length) {
+        const count = recent.length === recentCount ? recent.length : recent.length + ' / ' + recentCount;
+        group.append(sessionDrawer(target + ':recent', '近期空闲会话 · ' + count, recent, info.reachable, prefs.sessions, monitored));
+      }
+      if (hidden.length) {
+        group.append(sessionDrawer(target + ':hidden', '已隐藏 · ' + hidden.length, hidden, info.reachable, prefs.sessions, monitored));
+      }
+      root.append(group);
+    }
+  }
+
+  async function readState() {
+    try { update(await request('/api/state')); }
+    catch { if (!state) feedback('等待插件侧栏服务连接'); }
+  }
+  const onFocus = () => {
+    if (document.visibilityState !== 'visible' || focusInFlight) return;
+    focusInFlight = refresh('focus').finally(() => { focusInFlight = undefined; });
+  };
+  byId('refresh').onclick = async () => {
+    byId('refresh').disabled = true;
+    try { await refresh('manual'); } finally { byId('refresh').disabled = false; }
+  };
+  byId('pause').onclick = () => state && setPrefs({ paused: !state.prefs.paused });
+  byId('notifications').onclick = () => state && setPrefs({ notifications: !state.prefs.notifications });
+  const searchInput = byId('search');
+  const clearSearch = byId('clear-search');
+  const applySearch = value => {
+    searchQuery = value;
+    clearSearch.hidden = !searchQuery;
+    render();
+  };
+  searchInput.addEventListener('input', () => applySearch(searchInput.value));
+  clearSearch.addEventListener('click', () => {
+    searchInput.value = '';
+    applySearch('');
+    searchInput.focus();
+  });
+  document.addEventListener('visibilitychange', onFocus);
+  window.addEventListener('focus', onFocus);
+  setInterval(() => { if (document.visibilityState === 'visible') void readState(); }, 5000);
+  void readState();
+</script>
+</body>
+</html>

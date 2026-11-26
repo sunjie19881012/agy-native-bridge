@@ -1,0 +1,38 @@
+{
+  "win": {
+    "sessionsRoot": "C:/Users/YourWindowsUser/.codex/sessions",
+    "requestTimeoutMs": 15000
+  },
+  "remote": {
+    "sshTarget": "codex-101",
+    "transport": "desktop-pipe",
+    "requestTimeoutMs": 15000,
+    "watcherTimeoutMs": 14400000
+  },
+  "dsh": {
+    "win-dsh": {
+      "baseUrl": "http://127.0.0.1:8000",
+      "id": "win-dsh-host",
+      "environmentId": "office",
+      "token": "REPLACE_WITH_WINDOWS_COLLAB_TOKEN_32_CHARS",
+      "bridgeToken": "REPLACE_IF_BRIDGE_ACCESS_IS_ENABLED",
+      "requestTimeoutMs": 15000
+    },
+    "101-dsh": {
+      "baseUrl": "https://dsh-101.example.invalid",
+      "id": "101-dsh-host",
+      "environmentId": "development",
+      "token": "REPLACE_WITH_101_COLLAB_TOKEN_32_CHARS",
+      "requestTimeoutMs": 15000
+    }
+  },
+  "sidecar": {
+    "maxAutoReads": 5
+  },
+  "workspaces": {
+    "win-codex": {},
+    "101-codex": {},
+    "win-dsh": {},
+    "101-dsh": {}
+  }
+}

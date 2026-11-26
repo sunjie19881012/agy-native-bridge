@@ -1,0 +1,11 @@
+{
+  "agy-native-bridge": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node -e \"const f=require('node:fs'),p=require('node:path'),o=require('node:os'),u=require('node:url'),e=process.env;const roots=[e.PLUGIN_ROOT,e.AGY_PLUGIN_ROOT,e.GEMINI_HOME&&p.join(e.GEMINI_HOME,'config','plugins','agy-native-bridge'),p.join(o.homedir(),'.gemini','config','plugins','agy-native-bridge'),p.join('.agents','plugins','agy-native-bridge'),'.'];const root=roots.find(d=>d&&f.existsSync(p.resolve(d,'src/hooks/agy-session-start.mjs'))&&f.existsSync(p.resolve(d,'plugin.json')));if(root){import(u.pathToFileURL(p.resolve(root,'src/hooks/agy-session-start.mjs')).href).then(m=>m.runSessionStart()).catch(()=>process.stdout.write('{}'));}else process.stdout.write('{}');\"",
+        "timeout": 2
+      }
+    ]
+  }
+}

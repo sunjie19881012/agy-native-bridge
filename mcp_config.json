@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "native-bridge": {
+      "command": "node",
+      "args": ["${PLUGIN_ROOT}/src/mcp/server.mjs"],
+      "tools": {
+        "bridge_list": { "eager": true },
+        "bridge_status": { "eager": true },
+        "bridge_read": { "eager": true },
+        "bridge_send": { "eager": true }
+      }
+    }
+  }
+}
