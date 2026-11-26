@@ -5,6 +5,12 @@ description: 查看 Windows 和 101 上的原生 Codex 及已配置的 DSH 会�
 
 # Codex 原生会话桥接
 
+## 协作窗口默认分工原则
+
+当前 Antigravity 对话有配对，或用户指定了 Codex／DSH 协作窗口时，由协作窗口执行代码改动和自测。Antigravity 负责澄清需求、设计方案、派发、审查和验收。凡涉及视觉与界面相关任务（包括设计图、UI、网页布局、图片布局、视频剪辑等），先由 Antigravity 给出明确的设计样式、视觉规范与布局方案，再由协作窗口严格按规范落地，不交由协作窗口自由发挥视觉设计。有后续代码任务时用 bridge_send 派发给该协作窗口。只有用户明确要求 Antigravity 在本端直接动手时，才在本端修改代码。
+
+## 原生工具使用
+
 101 默认走 desktop-pipe，经按需 SSH 连到 101 当前用户的 Codex 桌面管道。若管道不可用，报告离线或回执未知。daemon 只用于显式配置的无桌面服务器。
 
 1. 用 bridge_list 找到目标，再用 bridge_status 核对 target、sessionId、标题和工作区。派发和中断都要填写 expectedWorkspace，使用已核对的目标工作区绝对路径。有重名或目标不明确时，请用户确认会话。

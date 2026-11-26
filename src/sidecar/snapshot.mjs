@@ -60,7 +60,7 @@ function mergeSession(prior, current, now, transitions) {
     unread = { kind: event, at: now, turnId };
     transitions.push({ target: current.target, sessionId: current.sessionId, kind: event,
       turnId, workspacePath: current.workspacePath, title: current.title });
-  }
+  } else if (isBusy) unread = null;
   return {
     ...current, outcome, unread, outcomeAt: finished ? now : isBusy ? null : prior?.outcomeAt ?? null,
     tracking: tracking && !finished
@@ -118,6 +118,7 @@ export function recordDispatch(state, notice, now) {
     target: notice.target, sessionId: notice.sessionId, title: '', state: 'unknown',
     workspacePath: notice.workspacePath, activeTurnId: null, activeFlags: [], updatedAt: null,
     ...previous,
+    unread: null,
     tracking: { turnId: notice.turnId ?? null, beforeTurnId: notice.beforeTurnId ?? null, mode: notice.mode, acceptedAt: now }
   };
   return {

@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { sessionStartSummary } from '../src/hooks/agy-session-start.mjs';
+import { hookConversationId, sessionStartSummary } from '../src/hooks/agy-session-start.mjs';
 import { checkMcp } from '../src/sidecar/doctor.mjs';
 
 const now = Date.parse('2026-11-25T07:00:00Z');
@@ -31,12 +31,43 @@ test('SessionStart 在缓存缺失、过期、全空闲、离线或未读太旧�
   }
 });
 
+test('SessionStart 只注入当前对话的未隐藏配对和分工，未关联对话静默', () => {
+  const state = sample([{ sessionId: 'second', state: 'idle', title: '原生标题' }]);
+  const prefs = { sessions: {
+    'win-dsh:paired-task': { pairedConversationId: 'chat_a', pairLabel: '示例任务', pairedAt: new Date(now).toISOString() },
+    '101-codex:second': { pairedConversationId: 'chat_b' },
+    'win-codex:excluded': { pairedConversationId: 'chat_a', hidden: true, pairLabel: '不应注入' }
+  } };
+  const message = (conversationId, snapshot = state) =>
+    sessionStartSummary(snapshot, now, { prefs, conversationId }).injectSteps?.[0].systemMessage.systemMessage;
+  const first = message('chat_a', null);
+  assert.match(first, /win-dsh paired-task「示例任务」.*默认由协作窗口改动、自测/);
+  assert.match(first, /仅用户明确要求时本端才改代码/);
+  assert.doesNotMatch(first, /excluded|不应注入|second/);
+  assert.equal(first.split('\n').length, 1);
+  assert.ok(Array.from(first).length < 120);
+  assert.match(message('chat_b'), /101-codex second「原生标题」/);
+  assert.equal(message('unrelated_chat'), undefined);
+  assert.equal(message(undefined), undefined);
+});
+
+test('SessionStart 从 stdin 识别对话 ID，空或非法内容安全回退到宿主环境', () => {
+  const env = { ANTIGRAVITY_CONVERSATION_ID: 'env_chat' };
+  assert.equal(hookConversationId('{"conversationId":"stdin_chat"}', env), 'stdin_chat');
+  assert.equal(hookConversationId('{"conversation_id":"second_chat"}', env), 'second_chat');
+  for (const bad of ['', '{bad JSON', '{"conversationId":"invalid/id"}', '{"conversationId":"--help"}']) {
+    assert.equal(hookConversationId(bad, env), 'env_chat');
+  }
+  assert.equal(hookConversationId('', {}), undefined);
+});
+
 test('Antigravity Hook 的实际命令找不到状态时输出空 JSON，doctor 执行真实本地 MCP 握手', () => {
   const hooks = JSON.parse(readFileSync(new URL('../hooks.json', import.meta.url), 'utf8'));
   const hook = hooks['agy-native-bridge'].SessionStart[0];
   assert.equal(hook.timeout, 2);
   assert.match(hook.command, /^node -e ".+"$/);
-  const env = { ...process.env, PLUGIN_ROOT: process.cwd(), AGY_NATIVE_BRIDGE_HOME: path.resolve('test', 'missing-home') };
+  const childEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^ANTIGRAVITY_/i.test(key)));
+  const env = { ...childEnv, PLUGIN_ROOT: process.cwd(), AGY_NATIVE_BRIDGE_HOME: path.resolve('test', 'missing-home') };
   const child = spawnSync(process.execPath, ['-e', hook.command.slice('node -e "'.length, -1)], {
     env, timeout: 2000, encoding: 'utf8'
   });

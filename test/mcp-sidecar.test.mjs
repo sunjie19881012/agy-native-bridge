@@ -25,7 +25,7 @@ test('bridge_list 使用新缓存，超过两个周期或强制刷新时实探�
       return [session('live')];
     }
   } }, {
-    clock: () => at,
+    env: {}, clock: () => at,
     loadState: () => ({
       intervalMs, sampledAt: date(age), targets: { [target]: {
         reachable: true, catalog: { reachable: true, sampledAt: date(age), sessions: [session('cached'), session('cached-2')] }
@@ -68,7 +68,7 @@ test('bridge_status 保持实探，附上新鲜额度，并忽略过期额度', 
   let probes = 0;
   const invoke = createToolInvoker({ [target]: {
     status: async () => { probes++; return session('fixture'); }
-  } }, { clock: () => at, loadState: () => ({ targets: {
+  } }, { env: {}, clock: () => at, loadState: () => ({ targets: {
     [target]: { rateLimits: { sampledAt: date(age), windows: { '7d': { remainingPercent: 61 } } } }
   } }) });
   assert.equal((await invoke('bridge_status', args)).rateLimits.windows['7d'].remainingPercent, 61);
@@ -88,7 +88,7 @@ test('60 秒同内容保护覆盖并发和未知回执，独立任务或明确�
     return Promise.resolve({ result, operationId: input.operationId });
   } };
   const invoke = createToolInvoker({ [target]: adapter, 'win-codex': adapter }, {
-    clock: () => now, post: async () => {}
+    env: {}, clock: () => now, post: async () => {}
   });
   const first = invoke('bridge_send', { ...args, operationId: 'first' });
   const duplicate = await invoke('bridge_send', { ...args, operationId: 'second', mode: 'steer' });
@@ -161,6 +161,55 @@ test('自动读取默认上限为五，可在 sidecar 配置中限为 1 到 20',
   for (const maxAutoReads of [0, 21, '5', 2.5, null]) {
     assert.throws(() => validateConfig({ sidecar: { maxAutoReads } }), { code: 'INVALID_CONFIG' });
   }
+});
+
+test('MCP 新建确认后把合法宿主绑定放进 nudge，非法 ID 不影响正常 nudge', async () => {
+  for (const [hostId, expected] of [['fixture_chat', 'fixture_chat'], ['--help', undefined]]) {
+    const calls = [];
+    const invoke = createToolInvoker({ [target]: {
+      create: async input => ({ ...input, result: 'created', sessionId: 'new-fixture' })
+    } }, { env: { ANTIGRAVITY_CONVERSATION_ID: hostId }, post: (...args) => calls.push(args) });
+    const created = await invoke('bridge_create', { target, workspacePath: '/mock', title: 'Example' });
+    await flush();
+    assert.equal(created.result, 'created');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], '/api/nudge');
+    assert.equal(calls[0][1].action, 'create');
+    assert.equal(calls[0][1].conversationId, expected);
+  }
+});
+
+test('bridge_read 返回公开消息后异步通知已读，仅带最后一个可用轮次 ID', { timeout: 1000 }, async () => {
+  const nudges = [];
+  const pages = [
+    { messages: [
+      { role: 'assistant', text: 'Earlier fixture', turnId: 'older' },
+      { role: 'assistant', text: 'Latest fixture', turnId: 'latest' },
+      { role: 'user', text: 'Fixture without a turn ID', turnId: null }
+    ], nextCursor: 'older-page' },
+    { messages: [{ role: 'assistant', text: 'Fixture without a turn ID' }] },
+    { messages: [] }
+  ];
+  const invoke = createToolInvoker({ [target]: {
+    read: async () => {
+      if (!pages.length) throw new BridgeError('NATIVE_DISCONNECTED', 'fixture offline');
+      return pages.shift();
+    }
+  } }, { env: {}, post(route, body) {
+    nudges.push([route, body]);
+    if (nudges.length === 1) return new Promise(() => {});
+    throw new Error('fixture sidecar offline');
+  } });
+  const read = { target, sessionId: args.sessionId };
+  assert.equal((await invoke('bridge_read', read)).nextCursor, 'older-page');
+  assert.equal((await invoke('bridge_read', read)).messages.length, 1);
+  assert.equal((await invoke('bridge_read', read)).messages.length, 0);
+  await assert.rejects(invoke('bridge_read', read), { code: 'NATIVE_DISCONNECTED' });
+  await flush();
+  assert.deepEqual(nudges, [
+    ['/api/nudge', { action: 'read', ...read, turnId: 'latest' }],
+    ['/api/nudge', { action: 'read', ...read }]
+  ]);
 });
 
 test('本地 nudge 只读取运行时端口并访问 127.0.0.1，失败返回 false', async () => {

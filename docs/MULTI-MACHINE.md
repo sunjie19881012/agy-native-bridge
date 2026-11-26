@@ -28,6 +28,12 @@
 
 每端独立配置 `baseUrl`（Bridge 根地址）、`id`（协作插件主机 ID）、`environmentId`、`token`（协作插件令牌，至少 32 字符）、可选 `bridgeToken` 和 `requestTimeoutMs`。启用了 Bridge 2.10 访问令牌时才填写 `bridgeToken`。实值只填各自电脑的用户配置。跨机连接宜使用受信 HTTPS。未配置的端不会出现在侧栏和 `bridge_list(target="all")` 中。
 
+## 对话配对与本地接力
+
+配对、短标签和自动读取偏好保存在各自机器。办公室与家里电脑可对同一原生会话建立不同的 Antigravity 配对。在要调度的窗口打开侧栏并绑定，再按「仅看当前对话」查看归属。自动读取已开启时，重新配对不会改变原唤醒目标。
+
+如果实现和评审会话都运行在同一 Linux 主机，可以直接在那台主机上运行有界接力。见 [本地双会话接力](LOCAL-RELAY.md) 和 [平台分工](PLATFORM-BOUNDARY.md)。
+
 ## 排错
 
 - 101 离线时先核对 SSH 别名、免密和进程归属。Node 不在远端非交互 `PATH` 时会搜索 nvm，也可用 `remote.nodeBin` 指定绝对路径。`remote.socketPath`、`remote.callerThreadId` 可显式固定；该 UUID 必须对应 101 上真实存在的会话。仅无桌面且明确配置 `daemon` 时才走旧控制 Socket。

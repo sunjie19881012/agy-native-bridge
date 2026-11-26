@@ -3,14 +3,14 @@ import { randomUUID } from 'node:crypto';
 import { isAutoReadLimit } from '../shared/config.mjs';
 import { publicMessage, redact } from '../shared/conversation.mjs';
 import { matchesWorkspace } from '../shared/creation.mjs';
+import { validHostId } from '../shared/pairing.mjs';
+export { validHostId };
 
 const cooldownMs = 30_000;
 const maxChars = 4000;
 const terminalLabels = { completed: '已完成', failed: '执行失败', interrupted: '已中断' };
 export const missingBinding = '请先打开要唤醒的 Antigravity 对话后再开启自动读取';
 
-// Reject option-shaped IDs even though hyphens are valid inside an ID.
-export const validHostId = value => typeof value === 'string' && /^(?!-)[0-9a-zA-Z_-]{1,128}$/.test(value);
 export const autoReadLimit = (preference, fallback) => isAutoReadLimit(preference.autoReadLimit) ? preference.autoReadLimit : fallback;
 
 function binding(conversationId, projectId) {
@@ -79,7 +79,7 @@ function terminalMessage(event, count, max, messages) {
   const introduction = [
     '【原会话自动读取】' + terminalLabels[event.kind] + ' · 第 ' + count + '/' + max + ' 轮',
     reference(event),
-    '请按本 Antigravity 对话中已获授权的原任务目标验收。',
+    '请按本 Antigravity 对话中已获授权的原任务目标验收。需要继续改代码时，默认通过 bridge_send 派发给协作窗口自测；仅用户明确要求直接改动时才在本端动手。',
     ...(count >= max
       ? ['已达连续自动跟进上限（' + max + ' 轮），已自动关闭本会话自动读取，如需继续请在侧栏重新开启。请汇报本轮结果并停止派发。']
       : ['仍有获授权的下一步时可继续推进一次，派发时请勿再次传 autoReadOnFinish。若任务已完成、需要老板决策或等待审批，请汇报并停止派发。']),
@@ -116,7 +116,7 @@ function seen(preference, event, tag) {
 
 const readHistory = preference => Array.isArray(preference.autoReadHistory) ? preference.autoReadHistory : [];
 
-export function createAutoRead({ getPreference, updatePreference, read, sendMessage, max, clock, timers, paused }) {
+export function createAutoRead({ getPreference, updatePreference, read, sendMessage, markRead, max, clock, timers, paused }) {
   const sessions = new Map();
   let stopped = false;
 
@@ -170,7 +170,9 @@ export function createAutoRead({ getPreference, updatePreference, read, sendMess
       await sendMessage(destination.conversationId, message, { projectId: destination.projectId });
     } catch {
       await report(key, run, '唤醒 Antigravity 失败，请在原对话核对');
+      return;
     }
+    if (!approval && !stopped) await markRead?.(event);
   }
 
   function drain(key, lane) {

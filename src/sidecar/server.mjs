@@ -10,7 +10,9 @@ import { bridgeTargets, quotaPeriodMs, readLocalJson } from '../shared/bridge-ca
 import { defaultMaxAutoReads, isAutoReadLimit, readConfig, stateDirectory, writeJsonAtomic } from '../shared/config.mjs';
 import { errorDetails } from '../shared/errors.mjs';
 import { dshTargets } from '../shared/targets.mjs';
-import { createAutoRead, enableAutoRead, findBinding, missingBinding, sendHostMessage, validHostId } from './auto-read.mjs';
+import { cleanPairText, pairConversation, validHostId } from '../shared/pairing.mjs';
+import { createAutoRead, enableAutoRead, findBinding, missingBinding, sendHostMessage } from './auto-read.mjs';
+import { readConversationTitle } from './conversation-title.mjs';
 import { createHeartbeat } from './heartbeat.mjs';
 import { applySamples, initialSnapshot, latestQuota, recordDispatch, watchIds } from './snapshot.mjs';
 
@@ -90,6 +92,7 @@ export async function startSidecar({
   config, adapters, directory = stateDirectory(), port = 0, uiToken = '', clock = Date.now,
   timers = globalThis, notify = notifyWindows, read = readLocalJson, write = writeJsonAtomic,
   env = process.env, sendMessage = (id, message, options) => sendHostMessage(id, message, { ...options, env }),
+  lookupTitle = id => readConversationTitle(id, { env }),
   remove = unlink, listen = server => server.listen({ host: '127.0.0.1', port })
 } = {}) {
   const load = name => read(name, { directory });
@@ -101,6 +104,8 @@ export async function startSidecar({
   let state = initialSnapshot(previous, targets);
   let prefs = asPrefs(savedPrefs);
   let writes = Promise.resolve();
+  let closing = false;
+  const titleLookups = new Map();
   const nudgeToken = randomBytes(32).toString('hex');
   const maxAutoReads = config.sidecar?.maxAutoReads ?? defaultMaxAutoReads;
 
@@ -112,6 +117,16 @@ export async function startSidecar({
 
   const commit = next => { state = next; return save('state.json', next); };
 
+  function markRead({ target, sessionId, turnId }, expectedUnread) {
+    const row = state.targets[target];
+    const session = row.sessions.find(item => item.sessionId === sessionId);
+    const unread = session?.unread;
+    if (!unread || unread.kind === 'waiting_approval' || (expectedUnread && unread !== expectedUnread)
+        || (unread.turnId && turnId && unread.turnId !== turnId)) return;
+    const sessions = row.sessions.map(item => item === session ? { ...item, unread: null } : item);
+    return commit({ ...state, targets: { ...state.targets, [target]: { ...row, sessions } } });
+  }
+
   const preference = key => prefs.sessions[key] ?? {};
   function updatePreference(key, change) {
     const previous = preference(key);
@@ -120,9 +135,24 @@ export async function startSidecar({
     prefs = { ...prefs, sessions: { ...prefs.sessions, [key]: next } };
     return save('prefs.json', prefs);
   }
+  function fillPairTitle(key, conversationId) {
+    if (!conversationId || closing) return;
+    let lookup = titleLookups.get(conversationId);
+    if (!lookup) {
+      lookup = Promise.resolve().then(() => lookupTitle(conversationId)).finally(() => titleLookups.delete(conversationId));
+      titleLookups.set(conversationId, lookup);
+    }
+    void lookup.then(title => {
+      if (closing || !title) return;
+      const clean = cleanPairText(title, 80);
+      if (!clean) return;
+      return updatePreference(key, prior => prior.pairedConversationId === conversationId && prior.pairedConversationTitle !== clean
+        ? { ...prior, pairedConversationTitle: clean } : prior);
+    }).catch(() => {});
+  }
   const autoRead = createAutoRead({
     getPreference: preference, updatePreference,
-    read: (target, id, options) => adapters[target].read(id, options), sendMessage,
+    read: (target, id, options) => adapters[target].read(id, options), sendMessage, markRead,
     max: maxAutoReads, clock, timers, paused: () => prefs.paused
   });
 
@@ -208,12 +238,7 @@ export async function startSidecar({
         const page = await adapters[target].read(id, { limit: 6, maxChars: 1600 });
         const turnId = selected.latestTurn?.id ?? page.messages.at(-1)?.turnId;
         const messages = page.messages.filter(message => message.turnId === turnId);
-        if (event && (!event.turnId || event.turnId === turnId) && messages.length) {
-          const current = state.targets[target];
-          const sessions = current.sessions.map(session => session.sessionId === id && session.unread === event
-            ? { ...session, unread: null } : session);
-          await commit({ ...state, targets: { ...state.targets, [target]: { ...current, sessions } } });
-        }
+        if (event && messages.length) await markRead({ target, sessionId: id, turnId }, event);
         return answer(200, { messages, truncated: page.pageTruncated });
       }
       if (request.method !== 'POST') return answer(404, { error: 'not_found' });
@@ -227,15 +252,28 @@ export async function startSidecar({
         if (isTarget(body.target) && isSession(body.sessionId)) {
           const key = body.target + ':' + body.sessionId;
           if (invalidHostIds(body)) return answer(400, { error: 'invalid_host_id', message: 'Antigravity 对话或项目 ID 格式无效' });
+          if ((body.pairCurrent !== undefined && typeof body.pairCurrent !== 'boolean')
+              || (body.pairedConversationId != null && !validHostId(body.pairedConversationId))
+              || (body.pairLabel !== undefined && typeof body.pairLabel !== 'string')) {
+            return answer(400, { error: 'invalid_pairing', message: '对话 ID 或配对标签格式无效' });
+          }
           if (body.autoReadLimit !== undefined && !isAutoReadLimit(body.autoReadLimit)) {
             return answer(400, { error: 'invalid_auto_read_limit', message: '跟进轮数上限必须是 1 到 20 的整数' });
           }
           const current = preference(key);
+          let pairId = body.pairedConversationId;
+          if (body.pairCurrent === true) {
+            if (!validHostId(body.conversationId)) {
+              return answer(400, { error: 'missing_conversation_id', message: '请先打开要绑定的 Antigravity 对话' });
+            }
+            pairId = body.conversationId;
+          } else if (body.pairCurrent === false) pairId = null;
           let automatic = {};
           if (body.autoRead === true && current.autoRead !== true) {
             const destination = findBinding(body, current, env);
             if (!destination) return answer(400, { error: 'missing_conversation_id', message: missingBinding });
             automatic = enableAutoRead(current, destination);
+            if (pairId === undefined) pairId = destination.conversationId;
           } else if (body.autoRead === false) {
             automatic = { autoRead: false, autoReadRunId: null, autoReadError: null };
           }
@@ -246,7 +284,12 @@ export async function startSidecar({
                 autoReadError: '跟进轮数已达到新上限，自动读取已关闭' });
             }
           }
-          await updatePreference(key, prior => ({ ...prior, ...automatic, ...sessionPreference(body) }));
+          await updatePreference(key, prior => {
+            const changed = { ...prior, ...automatic, ...sessionPreference(body) };
+            if (body.pairLabel !== undefined) changed.pairLabel = cleanPairText(body.pairLabel, 32);
+            return pairId === undefined ? changed : pairConversation(changed, pairId, clock());
+          });
+          fillPairTitle(key, pairId);
           autoRead.changed(key);
         } else {
           if (typeof body.paused !== 'boolean' && typeof body.notifications !== 'boolean') return answer(400, { error: 'invalid_preferences' });
@@ -261,21 +304,30 @@ export async function startSidecar({
         return answer(200, view());
       }
       if (url.pathname === '/api/nudge') {
-        if (!isTarget(body.target) || !isSession(body.sessionId) || !['send', 'interrupt', 'create'].includes(body.action)) {
+        if (!isTarget(body.target) || !isSession(body.sessionId) || !['send', 'interrupt', 'create', 'read'].includes(body.action)) {
           return answer(400, { error: 'invalid_action' });
         }
         if (invalidHostIds(body)) return answer(400, { error: 'invalid_host_id' });
+        if (body.action === 'read') {
+          await markRead(body);
+          return answer(202, { ok: true });
+        }
         let missingConversation = false;
-        if (body.action === 'send' && (body.conversationId || body.autoReadOnFinish === true)) {
+        if ((body.action === 'send' || body.action === 'create') && (body.conversationId || body.autoReadOnFinish === true)) {
           const key = body.target + ':' + body.sessionId;
+          let pairId = body.conversationId || undefined;
           await updatePreference(key, prior => {
-            const next = body.conversationId ? { ...prior, lastDispatchConversationId: body.conversationId,
+            let next = body.conversationId ? { ...prior, lastDispatchConversationId: body.conversationId,
               lastDispatchProjectId: body.projectId || null } : prior;
-            if (body.autoReadOnFinish !== true || next.autoRead || next.autoReadLimitReached) return next;
-            const destination = findBinding(body, next, env);
-            missingConversation = !destination;
-            return destination ? enableAutoRead(next, destination) : { ...next, autoReadError: missingBinding };
+            if (body.action === 'send' && body.autoReadOnFinish === true && !next.autoRead && !next.autoReadLimitReached) {
+              const destination = findBinding(body, next, env);
+              missingConversation = !destination;
+              next = destination ? enableAutoRead(next, destination) : { ...next, autoReadError: missingBinding };
+              pairId ??= destination?.conversationId;
+            }
+            return pairId ? pairConversation(next, pairId, clock()) : next;
           });
+          fillPairTitle(key, pairId);
         }
         if (body.action === 'send' || (body.action === 'create' && body.tracking === true)) {
           await commit(recordDispatch(state, body, clock()));
@@ -313,6 +365,7 @@ export async function startSidecar({
     port: selectedPort, server,
     close() {
       return closePromise ??= (async () => {
+        closing = true;
         autoRead.stop();
         const stopped = heartbeat.stop();
         const httpClosed = new Promise(resolve => server.close(resolve));

@@ -8,6 +8,7 @@ import { BridgeError, errorDetails } from '../shared/errors.mjs';
 import { cachedCatalog, postSidecar, readLocalJson } from '../shared/bridge-cache.mjs';
 import { latestQuota } from '../sidecar/snapshot.mjs';
 import { dshTargets, toolTargets } from '../shared/targets.mjs';
+import { validHostId } from '../shared/pairing.mjs';
 
 const versions = ['2025-11-25', '2025-03-26', '2024-11-05'];
 const targetNames = toolTargets;
@@ -76,6 +77,10 @@ export function createToolInvoker(adapters, {
   const recentSends = new Map();
   const load = () => Promise.resolve().then(loadState).catch(() => null);
   const notify = (route, body) => { void Promise.resolve().then(() => post(route, body)).catch(() => {}); };
+  const host = {
+    ...(validHostId(env.ANTIGRAVITY_CONVERSATION_ID) && { conversationId: env.ANTIGRAVITY_CONVERSATION_ID }),
+    ...(validHostId(env.ANTIGRAVITY_PROJECT_ID) && { projectId: env.ANTIGRAVITY_PROJECT_ID })
+  };
 
   async function list(args) {
     const selected = !args.target || args.target === 'all'
@@ -130,8 +135,7 @@ export function createToolInvoker(adapters, {
       if (result.result === 'accepted') notify('/api/nudge', {
         action: 'send', target: args.target, sessionId: args.sessionId, workspacePath: args.expectedWorkspace,
         mode, turnId: result.turnId, beforeTurnId: result.beforeTurnId,
-        ...(env.ANTIGRAVITY_CONVERSATION_ID && { conversationId: env.ANTIGRAVITY_CONVERSATION_ID }),
-        ...(env.ANTIGRAVITY_PROJECT_ID && { projectId: env.ANTIGRAVITY_PROJECT_ID }),
+        ...host,
         ...(args.autoReadOnFinish !== undefined && { autoReadOnFinish: args.autoReadOnFinish })
       });
       if (result.result === 'accepted' && args.target === '101-codex' && args.notifyOnFinish === true) {
@@ -160,6 +164,7 @@ export function createToolInvoker(adapters, {
         const started = args.prompt !== undefined && (result.promptDelivery === undefined || result.promptDelivery.result === 'accepted');
         notify('/api/nudge', {
           action: 'create', target: args.target, sessionId: result.sessionId, workspacePath: result.workspacePath,
+          ...host,
           ...(started && { tracking: true, turnId: result.promptDelivery?.turnId, beforeTurnId: result.promptDelivery?.beforeTurnId })
         });
       }
@@ -180,7 +185,14 @@ export function createToolInvoker(adapters, {
       const rateLimits = latestQuota(await load(), args.target, clock());
       return rateLimits ? { ...status, rateLimits } : status;
     }
-    if (name === 'bridge_read') return adapter.read(args.sessionId, args);
+    if (name === 'bridge_read') {
+      const result = await adapter.read(args.sessionId, args);
+      if (Array.isArray(result?.messages) && result.messages.length) {
+        const turnId = result.messages.findLast(message => typeof message?.turnId === 'string' && message.turnId)?.turnId;
+        notify('/api/nudge', { action: 'read', target: args.target, sessionId: args.sessionId, ...(turnId && { turnId }) });
+      }
+      return result;
+    }
     if (name === 'bridge_interrupt') {
       const result = await adapter.interrupt(args);
       if (result.result === 'accepted') notify('/api/nudge', {

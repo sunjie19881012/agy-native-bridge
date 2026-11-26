@@ -152,6 +152,9 @@ test('快照跟踪派发前后轮次、审批和完成未读，额度只保存 C
   assert.ok(old.row.tracking);
   update('active', 'new', 'inProgress');
   assert.equal(update('waiting_approval', 'new', 'inProgress').row.unread.kind, 'waiting_approval');
+  const resumed = update('active', 'new', 'inProgress');
+  assert.equal(resumed.row.unread, null);
+  assert.deepEqual(resumed.transitions, []);
   const finished = update('idle', 'new', 'completed', { rateLimitsByLimitId: { codex: {
     primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 100 },
     secondary: { usedPercent: 60, windowDurationMins: 10080 }
@@ -162,6 +165,26 @@ test('快照跟踪派发前后轮次、审批和完成未读，额度只保存 C
   assert.deepEqual(snapshot.targets[target].rateLimits.windows, {
     '5h': { remainingPercent: 75, resetsAt: 100 }, '7d': { remainingPercent: 40, resetsAt: null }
   });
-  update('active', 'next', 'inProgress');
-  assert.equal(update('idle', 'next', 'failed').row.outcome, 'failed');
+  const next = update('active', 'next', 'inProgress');
+  assert.equal(next.row.unread, null);
+  assert.equal(next.row.outcome, null);
+  assert.deepEqual(next.transitions, []);
+  assert.equal(update('idle', 'next', 'failed').row.unread.kind, 'failed');
+  update('active', 'last', 'inProgress');
+  assert.equal(update('idle', 'last', 'interrupted').row.unread.kind, 'interrupted');
+});
+
+test('记录新派发或跟踪新建首轮时清除旧回复，空会话新建保持快照', () => {
+  const target = '101-codex';
+  const sessionId = 'fixture';
+  const state = initialSnapshot({ targets: { [target]: { sessions: [{
+    sessionId, state: 'idle', outcome: 'completed', unread: { kind: 'completed', turnId: 'old-turn' }
+  }] } } });
+  const notice = { target, sessionId, turnId: 'new-turn', workspacePath: '/mock' };
+  for (const fields of [{ action: 'send' }, { action: 'create', tracking: true }]) {
+    const row = recordDispatch(state, { ...notice, ...fields }, 1000).targets[target].sessions[0];
+    assert.equal(row.unread, null);
+    assert.equal(row.tracking.turnId, 'new-turn');
+  }
+  assert.equal(recordDispatch(state, { ...notice, action: 'create' }, 1000), state);
 });

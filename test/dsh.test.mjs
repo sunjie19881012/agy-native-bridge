@@ -157,7 +157,7 @@ test('DSH 写请求中途断开或超时只提交一次，MCP 在 60 秒内阻�
     if (action === 'send') throw new DOMException(token, 'TimeoutError');
     throw new Error(bridgeToken);
   } });
-  const invoke = createToolInvoker({ '101-dsh': f.adapter }, { post: () => {}, loadState: () => null });
+  const invoke = createToolInvoker({ '101-dsh': f.adapter }, { env: {}, post: () => {}, loadState: () => null });
   const args = { target: '101-dsh', sessionId: original, expectedWorkspace: f.expectedWorkspace, prompt: 'sample' };
   const sent = await invoke('bridge_send', args);
   assert.equal(sent.result, 'unknown');
@@ -198,6 +198,7 @@ test('MCP 全部目标忽略未配置 DSH 及残留缓存，显式调用返回�
   const codex = { list: async () => [] };
   const f = fixture('101-dsh');
   const invoke = createToolInvoker({ 'win-codex': codex, '101-codex': codex, '101-dsh': f.adapter }, {
+    env: {},
     loadState: () => ({ targets: { 'win-dsh': { catalog: { sessions: [{ sessionId: 'old' }] } } } }), post: () => {}
   });
   const all = await invoke('bridge_list', { target: 'all', fresh: true });

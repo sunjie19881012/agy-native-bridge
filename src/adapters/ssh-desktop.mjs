@@ -134,15 +134,23 @@ export async function connectRemoteDesktop(config, spawnProcess) {
 }
 
 export async function connectLocalDesktopReader(config, sessionId) {
+  return connectLocalDesktop(config, sessionId, new Set(['read_thread']));
+}
+
+export async function connectLocalRelayDesktop(config, sessionId) {
+  return connectLocalDesktop(config, sessionId, new Set(['read_thread', 'send_message_to_thread']));
+}
+
+async function connectLocalDesktop(config, sessionId, tools) {
   if (config.transport !== 'desktop-pipe') {
-    throw new BridgeError('NATIVE_TOOL_UNAVAILABLE', '此读取器仅用于 101 桌面管道。');
+    throw new BridgeError('NATIVE_TOOL_UNAVAILABLE', '此连接仅用于本机 Codex 桌面管道。');
   }
   const connect = socketPath => connectSocket(socketPath, path => net.createConnection(path));
   const socket = config.socketPath ? await connect(config.socketPath)
     : await discoverDesktopSocket(process.geteuid(), { lstat, readdir, connect });
   if (!socket) throw new BridgeError('PIPE_UNAVAILABLE', '无法打开 101 桌面管道。');
   return connectDesktopPipe(socket, {
-    timeoutMs: config.requestTimeoutMs, tools: new Set(['read_thread']), label: '101 桌面管道',
+    timeoutMs: config.requestTimeoutMs, tools, label: '101 桌面管道',
     threadId: () => sessionId, closeTransport: () => socket.destroy()
   });
 }

@@ -128,7 +128,7 @@ test('MCP 新建成功尽力触发 Sidecar，初始消息已获确认时才记�
         reminder, ...(args.prompt && { promptDelivery: { result: 'accepted', turnId: 'first' } })
       };
     }
-  } }, { async post(route, body) { nudges.push([route, body]); throw new Error('sidecar down'); } });
+  } }, { env: {}, async post(route, body) { nudges.push([route, body]); throw new Error('sidecar down'); } });
   const args = { target, workspacePath: 'C:\\Fixture', title: 'Mock' };
   assert.equal((await invoker('bridge_create', args)).result, 'created');
   assert.equal((await invoker('bridge_create', { ...args, prompt: 'mock' })).result, 'created');

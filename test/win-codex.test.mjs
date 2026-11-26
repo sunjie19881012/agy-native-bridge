@@ -21,6 +21,19 @@ function frame(message) {
   return Buffer.concat([header, body]);
 }
 
+async function listenMockPipe(t, server) {
+  if (process.platform === 'win32') server.listen('\\\\.\\pipe\\agy-window-fixture-' + randomUUID());
+  else server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(resolve => server.close(resolve)));
+}
+
+function connectMockPipe(server) {
+  const address = server.address();
+  return typeof address === 'string' ? net.createConnection(address)
+    : net.createConnection({ host: '127.0.0.1', port: address.port });
+}
+
 async function fixture(t, extra = {}) {
   const endpoint = '\\\\.\\pipe\\codex-app-tools-' + randomUUID();
   const callerThreadId = randomUUID();
@@ -350,11 +363,7 @@ test('Windows 首条管道挂起时自动切换至健康管道并在冷却期跳
     else result = { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify({ threads: [{ id: sessionId, title: 'Recovered', cwd: workspace, hostId: 'local', status: { type: 'idle' } }] }) }] };
     socket.write(frame({ jsonrpc: '2.0', id: req.id, result }));
   });
-  for (const server of [zombieServer, healthyServer]) {
-    server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
-    t.after(() => new Promise(resolve => server.close(resolve)));
-  }
+  for (const server of [zombieServer, healthyServer]) await listenMockPipe(t, server);
   const io = {
     async readFile() { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); },
     async readdir(dir) { return dir === '\\\\.\\pipe\\' ? [zombieName, healthyName] : []; }
@@ -367,8 +376,7 @@ test('Windows 首条管道挂起时自动切换至健康管道并在冷却期跳
     clock: () => now,
     createSocket: endpoint => {
       attempts.push(endpoint);
-      const port = endpoint === zombiePipe ? zombieServer.address().port : healthyServer.address().port;
-      return net.createConnection({ host: '127.0.0.1', port });
+      return connectMockPipe(endpoint === zombiePipe ? zombieServer : healthyServer);
     }
   });
   const first = await adapter.list(5);
@@ -411,11 +419,7 @@ test('Windows 写入工具在首条管道超时时保持 unknown 且绝不在备
   });
   const serverA = createMultiServer(pipeA);
   const serverB = createMultiServer(pipeB);
-  for (const server of [serverA, serverB]) {
-    server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
-    t.after(() => new Promise(resolve => server.close(resolve)));
-  }
+  for (const server of [serverA, serverB]) await listenMockPipe(t, server);
   const io = {
     async readFile() { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); },
     async readdir(dir) { return dir === '\\\\.\\pipe\\' ? [pipeAName, pipeBName] : []; }
@@ -424,7 +428,7 @@ test('Windows 写入工具在首条管道超时时保持 unknown 且绝不在备
     env: { AGY_NATIVE_BRIDGE_HOME: path.resolve('test', 'missing-home') },
     io,
     platform: 'win32',
-    createSocket: endpoint => net.createConnection({ host: '127.0.0.1', port: (endpoint === pipeA ? serverA : serverB).address().port })
+    createSocket: endpoint => connectMockPipe(endpoint === pipeA ? serverA : serverB)
   });
   const outcome = await adapter.send({ sessionId, expectedWorkspace: workspace, prompt: 'no-retry', mode: 'queue', operationId: 'op-no-retry' });
   assert.equal(outcome.result, 'unknown');

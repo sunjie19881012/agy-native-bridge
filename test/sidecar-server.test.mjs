@@ -7,6 +7,7 @@ import path from 'node:path';
 import { setImmediate as flush } from 'node:timers/promises';
 import test from 'node:test';
 import { sendHostMessage } from '../src/sidecar/auto-read.mjs';
+import { readConversationTitle } from '../src/sidecar/conversation-title.mjs';
 import { startSidecar } from '../src/sidecar/server.mjs';
 
 const target = '101-codex';
@@ -36,7 +37,7 @@ function endpointRequest(app, method, route, value, headers = {}) {
   });
 }
 
-async function fixture(t, saved = {}, configuredDsh, { env = {}, sendMessage, readPage, sidecar } = {}) {
+async function fixture(t, saved = {}, configuredDsh, { env = {}, sendMessage, readPage, sidecar, lookupTitle } = {}) {
   const initialAt = 1_761_000_000_000;
   let now = initialAt;
   let latest = { id: lastTurn, status: 'inProgress' };
@@ -66,6 +67,7 @@ async function fixture(t, saved = {}, configuredDsh, { env = {}, sendMessage, re
   const app = await startSidecar({
     port: process.platform === 'win32' ? 41112 : 0, uiToken, clock: () => now, env,
     config: { workspaces: { [target]: { fixed: '/fixture' } }, sidecar },
+    lookupTitle,
     async sendMessage(...args) { wakes.push(args); await sendMessage?.(...args); },
     adapters: { [target]: { heartbeat: heartbeat(target), read: async (...args) => {
       reads.push(args);
@@ -99,7 +101,7 @@ async function fixture(t, saved = {}, configuredDsh, { env = {}, sendMessage, re
 test('生产默认绑定 127.0.0.1 的系统分配端口，关闭后清理运行时记录', { timeout: 10_000 }, async t => {
   const files = new Map();
   const app = await startSidecar({
-    config: {}, adapters: {},
+    config: {}, adapters: {}, env: {},
     read: async key => key === 'prefs.json' ? { paused: true } : files.get(key),
     write: async (file, data) => { files.set(path.basename(file), data); },
     remove: async file => { files.delete(path.basename(file)); }
@@ -157,7 +159,8 @@ test('侧栏优先用监控状态去重，目录空闲会话进入抽屉并限�
   const groups = new Function(script.slice(start, end) + '\nreturn groupSessions;')();
   const idle = Array.from({ length: 22 }, (_, i) => ({ sessionId: 'idle-' + i, state: 'idle' }));
   const info = {
-    sessions: [{ sessionId: 'duplicate', state: 'active' }, { sessionId: 'unread', state: 'idle', unread: {} }],
+    sessions: [{ sessionId: 'duplicate', state: 'active' }, { sessionId: 'unread', state: 'idle',
+      outcome: 'completed', unread: { kind: 'completed' } }],
     catalog: { sessions: [
       ...idle, { sessionId: 'duplicate', state: 'idle' }, { sessionId: 'approval', state: 'waiting_approval' },
       { sessionId: 'star', state: 'idle' }, { sessionId: 'hidden', state: 'idle' }
@@ -364,6 +367,174 @@ test('自动读取默认关闭，只监控已开启且未隐藏的会话', async
   assert.ok(!f.probes.filter(call => call.host === target).at(-1).sessionIds.includes(catalog.sessionId));
 });
 
+test('手动、MCP 与自动读取建立会话配对，自定义标签跨窗口保留', async t => {
+  const requests = [];
+  const f = await fixture(t, {}, undefined, { lookupTitle: async conversationId => {
+    requests.push(conversationId);
+    if (conversationId === 'unavailable_chat') throw new Error('offline fixture');
+    return 'Title\u0000 ' + conversationId + ' password=synthetic-value ' + 'z'.repeat(100);
+  } });
+  const missing = await autoReadSetting(f, { pairCurrent: true });
+  assert.equal(missing.status, 400);
+  assert.match(missing.body.message, /请先打开/);
+  for (const fields of [{ pairedConversationId: '--help' }, { pairedConversationId: 'not/a/chat' },
+    { pairCurrent: 'false' }, { pairLabel: 99 }]) {
+    assert.equal((await autoReadSetting(f, fields)).status, 400);
+  }
+  const saved = await autoReadSetting(f, { pairCurrent: true, conversationId: 'first_chat',
+    pairLabel: '我的标签\u001b token=example-value ' + '界'.repeat(80) });
+  await flush();
+  assert.equal(saved.status, 200);
+  assert.equal(autoReadPref(f).pairedConversationId, 'first_chat');
+  assert.ok(Date.parse(autoReadPref(f).pairedAt));
+  assert.match(autoReadPref(f).pairedConversationTitle, /Title first_chat password=\[已遮盖\]/);
+  assert.equal(Array.from(autoReadPref(f).pairedConversationTitle).length, 80);
+  assert.equal(Array.from(autoReadPref(f).pairLabel).length, 32);
+  const label = autoReadPref(f).pairLabel;
+  assert.doesNotMatch(label, /example-value|\u001b/);
+
+  const headers = { 'X-Bridge-Token': f.files.get(runtimeName).nudgeToken };
+  f.tick(1000);
+  const send = { target, sessionId: id, workspacePath: '/mock', action: 'send', conversationId: 'unavailable_chat' };
+  assert.equal((await f.request('POST', '/api/nudge', send, headers)).status, 202);
+  await flush();
+  assert.equal(autoReadPref(f).pairedConversationId, 'unavailable_chat');
+  assert.equal(autoReadPref(f).pairedConversationTitle, null);
+  assert.equal(autoReadPref(f).pairLabel, label);
+  assert.notEqual(autoReadPref(f).pairedAt, saved.body.prefs.sessions[autoReadKey].pairedAt);
+
+  const otherKey = target + ':created';
+  await f.request('POST', '/api/nudge', { ...send, action: 'create', sessionId: 'created', conversationId: 'create_chat' }, headers);
+  await flush();
+  assert.equal(f.files.get('prefs.json').sessions[otherKey].pairedConversationId, 'create_chat');
+  await autoReadSetting(f, { autoRead: true, conversationId: 'wake_chat' });
+  assert.equal(autoReadPref(f).pairedConversationId, 'wake_chat');
+  assert.equal(autoReadPref(f).autoReadConversationId, 'wake_chat');
+  await autoReadSetting(f, { pairedConversationId: 'explicit_chat' });
+  assert.equal(autoReadPref(f).pairedConversationId, 'explicit_chat');
+  assert.equal(autoReadPref(f).autoReadConversationId, 'wake_chat');
+  await autoReadSetting(f, { pairCurrent: false });
+  await flush();
+  assert.equal(autoReadPref(f).pairedConversationId, null);
+  assert.equal(autoReadPref(f).pairedConversationTitle, null);
+  assert.equal(autoReadPref(f).pairLabel, label);
+  assert.ok(requests.includes('create_chat'));
+  assert.ok(requests.includes('unavailable_chat'));
+});
+
+test('ConversationService 标题只读查询限制为本机，优先 annotations 后回退 summary', async () => {
+  const env = { ANTIGRAVITY_LS_ADDRESS: '127.0.0.1:4555', ANTIGRAVITY_CSRF_TOKEN: 'mock-csrf' };
+  const query = async payload => readConversationTitle('fixture_chat', { env, fetch: async (url, options) => {
+    assert.equal(url.href, 'http://127.0.0.1:4555/product.v1.ConversationService/GetConversation');
+    assert.equal(options.method, 'POST');
+    assert.equal(options.headers['Connect-Protocol-Version'], '1');
+    assert.equal(options.headers['x-antigravity-csrf-token'], env.ANTIGRAVITY_CSRF_TOKEN);
+    assert.equal(options.redirect, 'error');
+    assert.equal(options.signal.aborted, false);
+    assert.deepEqual(JSON.parse(options.body), { conversationId: 'fixture_chat' });
+    return Response.json(payload);
+  } });
+  assert.equal(await query({ conversation: { annotations: { title: 'Example \u202e title' }, state: { summary: 'Fallback' } } }), 'Example title');
+  assert.equal(await query({ state: { summary: 'Summary' } }), 'Summary');
+  assert.equal(await query({ annotations: { title: 'Title mock-csrf' } }), 'Title [已遮盖]');
+  assert.equal(await readConversationTitle('fixture_chat', {
+    env, fetch: async () => { throw new Error('mock-csrf'); }
+  }), null);
+  const forbidden = () => assert.fail('read-only title request must not run');
+  assert.equal(await readConversationTitle('fixture_chat', { env: {}, fetch: forbidden }), null);
+  assert.equal(await readConversationTitle('fixture_chat', { env: { ...env, ANTIGRAVITY_LS_ADDRESS: 'example.invalid:4555' },
+    fetch: forbidden }), null);
+});
+
+function cardFixture() {
+  const html = readFileSync(new URL('../src/sidecar/ui.html', import.meta.url), 'utf8');
+  const code = html.slice(html.indexOf('  function card('), html.indexOf('  function sessionDrawer('));
+  const labelsCode = html.slice(html.indexOf('  const labels ='), html.indexOf('  const byId ='));
+  const el = (tag, className, text) => ({
+    tag, className, text, children: [], append(...nodes) { this.children.push(...nodes); }, setAttribute() {}, addEventListener() {}
+  });
+  let current = 'chat_a';
+  const { card, groupSessions } = new Function('el', 'currentConversation', 'button', 'autoReadControls', 'summaries',
+    'drawers', labelsCode + code + '\nreturn { card, groupSessions };')(
+    el, () => current, () => el('button'), () => el('span'), new Map(), new Set()
+  );
+  return { html, card, groupSessions, current: () => current, switchConversation: id => { current = id; } };
+}
+
+test('切换当前窗口时卡片高亮与置顶随之切换，仅看当前对话仍可配合搜索', () => {
+  const { html, card, groupSessions, current, switchConversation } = cardFixture();
+  const first = { target, sessionId: 'a', title: 'Alpha', state: 'idle' };
+  const second = { target, sessionId: 'b', title: 'Beta', state: 'waiting_approval' };
+  const prefs = {
+    [target + ':a']: { pairedConversationId: 'chat_a', pairLabel: 'Alpha label' },
+    [target + ':b']: { pairedConversationId: 'chat_b', pairedConversationTitle: 'Beta title' }
+  };
+  const info = { sessions: [second], catalog: { sessions: [first] } };
+  const group = (query, onlyCurrent) => groupSessions(info, row => prefs[target + ':' + row.sessionId], query, current(), onlyCurrent);
+  assert.deepEqual(group().visible.map(row => row.sessionId), ['a', 'b']);
+  const currentCard = card(first, true, prefs);
+  assert.match(currentCard.className, /current-pair/);
+  assert.equal(currentCard.children[1].text, '当前对话 · Alpha label');
+  assert.equal(card(second, true, prefs).children[1].text, '其他对话 · Beta title');
+  assert.deepEqual(group('', true).visible.map(row => row.sessionId), ['a']);
+  assert.equal(group('beta', true).matched, 0);
+  switchConversation('chat_b');
+  assert.deepEqual(group('', true).visible.map(row => row.sessionId), ['b']);
+  assert.match(card(second, true, prefs).className, /current-pair/);
+  assert.match(html, /id="current-only"[^>]*>仅看当前对话/);
+});
+
+test('卡片只在完成、失败或中断且有新回复时追加提示，审批和运行状态保持原标签', () => {
+  const { card } = cardFixture();
+  const badge = (row, reachable = true, monitored = true) => card({ target, sessionId: id, ...row },
+    reachable, {}, monitored).children[0].children[1].text;
+  const old = { kind: 'completed', turnId: 'old-turn' };
+  assert.equal(badge({ state: 'active', outcome: 'completed', unread: old }), '运行中');
+  assert.equal(badge({ state: 'waiting_approval', unread: { kind: 'waiting_approval' } }), '等待原窗口审批');
+  assert.equal(badge({ state: 'idle', outcome: 'completed', unread: old }, false), '离线');
+  assert.equal(badge({ state: 'unknown', unread: old }, true, false), '未加载');
+  assert.equal(badge({ state: 'unknown', unread: old }), '待确认');
+  assert.equal(badge({ state: 'paused', unread: old }), '暂停');
+  assert.equal(badge({ state: 'idle', unread: old }), '空闲');
+  for (const [outcome, label] of [['completed', '已完成'], ['failed', '失败'], ['interrupted', '已中断']]) {
+    assert.equal(badge({ state: 'idle', outcome, unread: { kind: outcome } }), label + ' · 新回复');
+    assert.equal(badge({ state: 'idle', outcome, unread: { kind: 'waiting_approval' } }), label);
+    assert.equal(badge({ state: 'idle', outcome, unread: null }), label);
+  }
+});
+
+test('已读 nudge 只清理匹配的终态轮次，无轮次 ID 时兼容旧记录，审批保留', async t => {
+  const legacy = { target, sessionId: 'legacy-read', workspacePath: '/mock', state: 'idle', unread: { kind: 'completed' } };
+  const f = await fixture(t, { 'state.json': { targets: { [target]: { reachable: true, sessions: [legacy] } } } });
+  await probe(f);
+  f.conclude();
+  await probe(f);
+  const headers = { 'X-Bridge-Token': f.files.get(runtimeName).nudgeToken };
+  const payload = { action: 'read', target, sessionId: id };
+  const unread = sessionId => f.files.get('state.json').targets[target].sessions.find(row => row.sessionId === sessionId)?.unread;
+  assert.equal((await f.request('POST', '/api/nudge', payload)).status, 401);
+  assert.equal((await f.request('POST', '/api/nudge', { ...payload, turnId: 'older' }, headers)).status, 202);
+  assert.equal(unread(id).turnId, lastTurn);
+  assert.equal((await f.request('POST', '/api/nudge', { ...payload, turnId: lastTurn }, headers)).status, 202);
+  assert.equal(unread(id), null);
+  await probe(f);
+  assert.equal(unread(id), null);
+  await f.request('POST', '/api/nudge', { ...payload, sessionId: legacy.sessionId, turnId: 'available' }, headers);
+  assert.equal(unread(legacy.sessionId), null);
+
+  f.observe('waiting_approval', 'approval-turn');
+  await probe(f);
+  await f.request('POST', '/api/nudge', payload, headers);
+  const summary = await f.request('GET', '/api/summary?target=101-codex&sessionId=' + id);
+  assert.equal(summary.body.messages[0].turnId, 'approval-turn');
+  assert.equal(unread(id).kind, 'waiting_approval');
+  f.observe('idle', 'approval-turn', 'completed');
+  await probe(f);
+  assert.equal(unread(id).kind, 'completed');
+  await f.request('POST', '/api/nudge', payload, headers);
+  assert.equal(unread(id), null);
+});
+
 test('终态读取精确轮次，脱敏并过滤私有输出，含完整引用且不超过 4000 字符', async t => {
   const f = await fixture(t, {}, undefined, { readPage: turnId => ({ workspacePath: '/mock', messages: [
     { role: 'user', turnId: 'prior', text: 'old turn private fixture' },
@@ -387,9 +558,11 @@ test('终态读取精确轮次，脱敏并过滤私有输出，含完整引用�
     assert.ok(message.includes(value), value);
   }
   assert.doesNotMatch(message, /private|mock_secret|mock_api/);
+  assert.match(message, /默认通过 bridge_send 派发给协作窗口自测.*仅用户明确要求/);
   assert.equal(message.length, 4000);
   assert.equal(autoReadPref(f).lastAutoReadTurnId, lastTurn);
   assert.equal(autoReadPref(f).autoReadCount, 1);
+  assert.equal(f.files.get('state.json').targets[target].sessions[0].unread, null);
 
   f.observe('active', lastTurn);
   await probe(f);
@@ -406,6 +579,7 @@ test('等待审批每轮只提醒一次，既不读正文也不计数，中断�
   for (let attempt = 0; attempt < 2; attempt++) {
     f.observe('waiting_approval', lastTurn);
     await probe(f);
+    assert.equal(f.files.get('state.json').targets[target].sessions[0].unread.kind, 'waiting_approval');
     f.observe('active', lastTurn);
     await probe(f);
   }
@@ -421,6 +595,27 @@ test('等待审批每轮只提醒一次，既不读正文也不计数，中断�
   assert.equal(result.targets[target].sessions[0].outcome, 'interrupted');
   assert.equal(f.wakes.length, 2);
   assert.match(f.wakes[1][1], /已中断 · 第 1\/5 轮/);
+  assert.equal(f.files.get('state.json').targets[target].sessions[0].unread, null);
+});
+
+test('旧轮次自动转发返回后保留更新轮次的未读回复', async t => {
+  let finishWake;
+  const host = new Promise(resolve => { finishWake = resolve; });
+  const f = await fixture(t, {}, undefined, { sendMessage: () => host });
+  await autoReadSetting(f, { autoRead: true, conversationId: 'fixture_chat' });
+  await probe(f);
+  f.conclude();
+  await probe(f);
+  assert.equal(f.wakes.length, 1);
+  assert.equal(f.files.get('state.json').targets[target].sessions[0].unread.turnId, lastTurn);
+  f.observe('active', 'later-turn');
+  await probe(f);
+  f.observe('idle', 'later-turn', 'failed');
+  await probe(f);
+  finishWake();
+  await flush();
+  assert.equal(f.wakes.length, 1);
+  assert.equal(f.files.get('state.json').targets[target].sessions[0].unread.turnId, 'later-turn');
 });
 
 test('连续跟进默认五轮，30 秒冷却期间不丢轮，熔断后派发参数无法重开', async t => {
@@ -534,6 +729,7 @@ test('原生读取失败和 agentapi 失败不阻塞心跳，错误留在卡片�
   await probe(f);
   assert.equal(autoReadPref(f).autoReadError, '自动读取公开问答失败');
   assert.equal(f.wakes.length, 0);
+  assert.equal(f.files.get('state.json').targets[target].sessions[0].unread.turnId, lastTurn);
 
   failRead = false;
   f.observe('active', 'newer');
@@ -550,6 +746,7 @@ test('原生读取失败和 agentapi 失败不阻塞心跳，错误留在卡片�
   await flush();
   assert.equal(autoReadPref(f).autoReadError, '唤醒 Antigravity 失败，请在原对话核对');
   assert.equal(autoReadPref(f).lastAutoReadTurnId, 'newer');
+  assert.equal(f.files.get('state.json').targets[target].sessions[0].unread.turnId, 'newer');
   const response = await probe(f);
   assert.doesNotMatch(JSON.stringify(response), /private/);
 });

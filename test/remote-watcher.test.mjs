@@ -187,7 +187,7 @@ test('MCP 只在 101 原生 accepted 后启动 opted-in 守望，启动失败不
     return { result: args.prompt === 'ambiguous' ? 'unknown' : 'accepted', turnId: null, beforeTurnId: 'previous' };
   } };
   const invoke = createToolInvoker({ '101-codex': adapter, 'win-codex': adapter }, {
-    loadState: () => null, post: () => {},
+    env: {}, loadState: () => null, post: () => {},
     async launchWatcher(args) { launches.push(args); throw new Error(mockKey); }
   });
   const args = { ...receipt, target: '101-codex', prompt: 'private prompt', notifyOnFinish: true };

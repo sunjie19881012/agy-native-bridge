@@ -23,14 +23,15 @@ const fixture = [
   "  create: async args => ({ result: 'created', target: '101-codex', sessionId: 'new-session', ...args })",
   '};',
   "const windows = { list: async () => { throw new BridgeError('PIPE_UNAVAILABLE', 'fixture offline'); } };",
-  "await serve({ '101-codex': remote, 'win-codex': windows });"
+  "await serve({ '101-codex': remote, 'win-codex': windows }, { env: {} });"
 ].join('\n');
 
 function stdio(messages, args = ['--input-type=module', '-e', fixture]) {
+  const childEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^ANTIGRAVITY_/i.test(key)));
   const child = spawnSync(process.execPath, args, {
     encoding: 'utf8', timeout: 10_000,
     input: messages.map(message => typeof message === 'string' ? message : JSON.stringify(message)).join('\n') + '\n',
-    env: { ...process.env, AGY_NATIVE_BRIDGE_HOME: path.resolve('test', 'missing-home'), CODEX_HOME: path.resolve('test', 'missing-home') }
+    env: { ...childEnv, AGY_NATIVE_BRIDGE_HOME: path.resolve('test', 'missing-home'), CODEX_HOME: path.resolve('test', 'missing-home') }
   });
   assert.equal(child.error, undefined);
   assert.equal(child.status, 0);

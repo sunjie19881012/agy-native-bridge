@@ -25,9 +25,18 @@ export function connectDaemon(config, spawnProcess) {
 }
 
 const readOnly = new Set(['thread/read', 'thread/turns/list']);
+const localRelay = new Set([...readOnly, 'thread/items/list', 'thread/resume', 'turn/start']);
 
 export function connectLocalDaemon(config) {
-  return connectDaemonTransport(config, readOnly, () => {
+  return connectLocalSocket(config, readOnly);
+}
+
+export function connectLocalRelayDaemon(config) {
+  return connectLocalSocket(config, localRelay);
+}
+
+function connectLocalSocket(config, methods) {
+  return connectDaemonTransport(config, methods, () => {
     const stream = net.createConnection(config.socketPath);
     stream.on('error', () => {});
     return { stream, close: () => stream.destroy() };

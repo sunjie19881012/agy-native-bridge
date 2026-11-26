@@ -15,10 +15,11 @@ function responseArray(result, field) {
 }
 
 export class RemoteCodex {
-  constructor(config, { spawnProcess } = {}) {
+  constructor(config, { spawnProcess, openDaemon } = {}) {
     this.config = config.remote;
     this.spawnProcess = spawnProcess;
     if (this.config.transport === 'daemon') {
+      this.openDaemon = openDaemon ?? (() => connectDaemon(this.config, this.spawnProcess));
       this.workspaces = new Map(Object.entries(config.workspaces[target] ?? {}));
     } else {
       this.desktop = new DesktopCodex({
@@ -28,7 +29,10 @@ export class RemoteCodex {
   }
 
   async withDaemon(action) {
-    const client = await connectDaemon(this.config, this.spawnProcess);
+    if (this.config.transport !== 'daemon') {
+      throw new BridgeError('NATIVE_TOOL_UNAVAILABLE', '仅在显式配置 daemon 时才允许连接 Codex Daemon。');
+    }
+    const client = await this.openDaemon();
     try { return await action(client); } finally { client.close(); }
   }
 

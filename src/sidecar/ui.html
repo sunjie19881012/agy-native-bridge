@@ -43,7 +43,7 @@
   .ring span { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 50%;
     background: var(--bg); color: var(--text); font-size: 10px; font-weight: 650; }
   .toolbar { margin: 14px 0 2px; flex-wrap: wrap; }
-  .search-bar { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .search-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
   .search-bar input { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; }
   .search-bar input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .search-bar button { font-size: 11px; }
@@ -58,6 +58,12 @@
   .count { font-size: 11px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); margin-top: 8px; padding: 10px; }
   .card.attention { border-color: var(--attention); }
+  .card.current-pair { outline: 1px solid var(--accent); outline-offset: -1px; }
+  .pair-badge { display: inline-block; max-width: 100%; margin: 5px 0; overflow-wrap: anywhere; }
+  .pair-badge.current { color: var(--accent); background: var(--accent-bg); }
+  .pair-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .pair-actions input { width: 9em; min-width: 0; padding: 4px; font: inherit; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 5px; }
   .badge { flex: none; padding: 3px 7px; border-radius: 20px; background: var(--bg); color: var(--muted); font-size: 10px; font-weight: 650; }
   .badge.active { color: var(--accent); background: var(--accent-bg); }
   .badge.waiting_approval { color: var(--attention); background: var(--attention-bg); }
@@ -108,6 +114,7 @@
   <div class="search-bar">
     <input id="search" type="search" placeholder="模糊搜索标题 / 工作区 / ID…" autocomplete="off" aria-label="模糊搜索会话">
     <button id="clear-search" type="button" hidden>清空</button>
+    <button id="current-only" type="button" aria-pressed="false">仅看当前对话</button>
   </div>
   <p id="feedback" class="muted" aria-live="polite"></p>
   <div id="targets"></div>
@@ -127,6 +134,11 @@
   let focusInFlight;
   let lastFeedback;
   let searchQuery = '';
+  let currentOnly = false;
+
+  function currentConversation() {
+    return window.sidecar?.conversationId ?? new URLSearchParams(location.search).get('conversationId') ?? '';
+  }
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -278,7 +290,7 @@
 
   function update(next) {
     state = next;
-    const fingerprint = JSON.stringify([next.sampledAt, next.prefs, next.targets]);
+    const fingerprint = JSON.stringify([currentConversation(), next.sampledAt, next.prefs, next.targets]);
     if (fingerprint === renderedSnapshot) return;
     renderedSnapshot = fingerprint;
     render();
@@ -365,14 +377,20 @@
   function card(row, reachable, preferences, isMonitored = true) {
     const key = row.target + ':' + row.sessionId;
     const pref = preferences[key] || {};
-    const baseCode = !reachable ? 'offline' : ['active', 'waiting_approval'].includes(row.state) ? row.state : row.outcome || row.state;
-    const code = reachable && !isMonitored && !row.outcome && baseCode === 'unknown' ? 'unloaded' : baseCode;
-    const node = el('article', 'card' + (code === 'waiting_approval' ? ' attention' : ''));
+    const code = cardState(row, reachable, isMonitored);
+    const current = Boolean(pref.pairedConversationId && pref.pairedConversationId === currentConversation());
+    const node = el('article', 'card' + (code === 'waiting_approval' ? ' attention' : '') + (current ? ' current-pair' : ''));
     const head = el('div', 'card-head');
     const title = el('h3', '', row.title || row.sessionId);
-    const badge = el('span', 'badge ' + code, (labels[code] || labels.unknown) + (row.unread ? ' · 未读' : ''));
+    const badge = el('span', 'badge ' + code, (labels[code] || labels.unknown) + (hasNewReply(row, code) ? ' · 新回复' : ''));
     head.append(title, badge);
     node.append(head);
+    if (pref.pairedConversationId) {
+      const label = pref.pairLabel || pref.pairedConversationTitle || pref.pairedConversationId.slice(0, 8);
+      const badge = el('span', 'badge pair-badge' + (current ? ' current' : ''), (current ? '当前对话' : '其他对话') + ' · ' + label);
+      if (pref.pairedConversationTitle) badge.title = pref.pairedConversationTitle;
+      node.append(badge);
+    }
     if (row.workspacePath) node.append(el('p', 'workspace', row.workspacePath));
     const options = el('div', 'actions');
     const change = values => setPrefs({ target: row.target, sessionId: row.sessionId, ...values });
@@ -382,6 +400,7 @@
       button(summaries.has(key) ? '收起摘要' : '最近一轮', () => toggleSummary(row, key), summaries.has(key)),
       autoReadControls(pref, change));
     node.append(options);
+    node.append(pairControls(key, pref, current, change));
     if (pref.autoReadError) node.append(el('p', 'auto-read-error', pref.autoReadError));
     if (summaries.has(key)) {
       const result = summaries.get(key);
@@ -399,18 +418,50 @@
     return node;
   }
 
-  function groupSessions(info, pref, query = '') {
+  function pairControls(key, pref, current, change) {
+    const drawer = el('details');
+    const drawerKey = 'pair:' + key;
+    drawer.open = drawers.has(drawerKey);
+    drawer.addEventListener('toggle', () => { if (drawer.open) drawers.add(drawerKey); else drawers.delete(drawerKey); });
+    drawer.append(el('summary', '', '对话配对'));
+    const form = el('form', 'pair-actions');
+    const input = el('input');
+    Object.assign(input, { value: pref.pairLabel || '', maxLength: 32, placeholder: '自定义短标签' });
+    input.setAttribute('aria-label', '配对短标签');
+    const bind = button(current ? '取消绑定' : '绑定当前对话', () => {
+      const conversationId = currentConversation();
+      if (!current && !conversationId) return feedback('请先打开要绑定的 Antigravity 对话');
+      void change({ pairCurrent: !current, ...(!current && { conversationId }) });
+    });
+    bind.type = 'button';
+    form.append(bind);
+    if (pref.pairedConversationId && !current) {
+      const unbind = button('取消绑定', () => change({ pairCurrent: false }));
+      unbind.type = 'button';
+      form.append(unbind);
+    }
+    const saveLabel = el('button', '', '保存标签');
+    saveLabel.type = 'submit';
+    form.append(input, saveLabel);
+    form.addEventListener('submit', event => { event.preventDefault(); void change({ pairLabel: input.value }); });
+    drawer.append(form);
+    return drawer;
+  }
+
+  function groupSessions(info, pref, query = '', currentId = '', onlyCurrent = false) {
     const monitored = new Map(info.sessions.map(row => [row.sessionId, row]));
     const rows = new Map(monitored);
     for (const row of info.catalog?.sessions ?? []) {
       if (!rows.has(row.sessionId)) rows.set(row.sessionId, row);
     }
-    const rank = row => (row.state === 'waiting_approval' ? 8 : 0) + (row.state === 'active' ? 4 : 0)
-      + (row.unread ? 2 : 0) + (pref(row).starred || pref(row).autoRead ? 1 : 0);
+    const isCurrent = row => Boolean(currentId && pref(row).pairedConversationId === currentId);
+    const rank = row => (isCurrent(row) ? 16 : 0) + (row.state === 'waiting_approval' ? 8 : 0) + (row.state === 'active' ? 4 : 0)
+      + (hasNewReply(row, cardState(row, info.reachable !== false, monitored.has(row.sessionId))) ? 2 : 0)
+      + (pref(row).starred || pref(row).autoRead ? 1 : 0);
     const sorted = [...rows.values()].sort((a, b) => rank(b) - rank(a)
       || (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
     const filtering = Boolean(String(query || '').trim());
-    const filtered = filtering ? sorted.filter(row => matchesQuery(row, query)) : sorted;
+    const filtered = sorted.filter(row => (!onlyCurrent || isCurrent(row)) && (!filtering || matchesQuery(row, query)));
     const visible = [];
     const recent = [];
     const hidden = [];
@@ -423,6 +474,17 @@
       total: rows.size, matched: filtered.length, monitored,
       visible, recent: recent.slice(0, 20), recentCount: recent.length, hidden
     };
+  }
+
+  function cardState(row, reachable, isMonitored) {
+    if (!reachable) return 'offline';
+    if (['active', 'waiting_approval'].includes(row.state)) return row.state;
+    if (!isMonitored && !row.outcome && row.state === 'unknown') return 'unloaded';
+    return row.outcome || row.state;
+  }
+
+  function hasNewReply(row, code) {
+    return ['completed', 'failed', 'interrupted'].includes(code) && row.unread && row.unread.kind !== 'waiting_approval';
   }
 
   function matchesQuery(row, query) {
@@ -469,12 +531,19 @@
     }
     const root = byId('targets');
     root.replaceChildren();
-    for (const target of targets) {
+    const currentId = currentConversation();
+    const onlyCurrent = Boolean(currentOnly && currentId);
+    byId('current-only').setAttribute('aria-pressed', String(onlyCurrent));
+    const groups = targets.flatMap(target => {
       const info = state.targets[target];
-      if (!info) continue;
+      if (!info) return [];
       const pref = row => prefs.sessions[target + ':' + row.sessionId] || {};
-      const { total, matched, monitored, visible, recent, recentCount, hidden } = groupSessions(info, pref, searchQuery);
-      const filtering = Boolean(searchQuery.trim());
+      const grouped = groupSessions(info, pref, searchQuery, currentId, onlyCurrent);
+      return [{ target, info, grouped, current: grouped.visible.some(row => currentId && pref(row).pairedConversationId === currentId) }];
+    }).sort((a, b) => Number(b.current) - Number(a.current));
+    for (const { target, info, grouped } of groups) {
+      const { total, matched, monitored, visible, recent, recentCount, hidden } = grouped;
+      const filtering = Boolean(searchQuery.trim() || onlyCurrent);
       const group = el('section', 'group');
       const heading = el('div', 'group-head');
       const countText = !info.reachable ? (info.sampledAt ? '离线' : '待同步')
@@ -483,7 +552,7 @@
       group.append(heading);
       visible.forEach(row => group.append(card(row, info.reachable, prefs.sessions, monitored.has(row.sessionId))));
       if (!total) group.append(el('p', 'empty', info.error?.message || '暂无会话'));
-      else if (filtering && !matched) group.append(el('p', 'empty', '未找到匹配会话'));
+      else if (filtering && !matched) group.append(el('p', 'empty', onlyCurrent ? '当前对话暂无匹配会话' : '未找到匹配会话'));
       if (recent.length) {
         const count = recent.length === recentCount ? recent.length : recent.length + ' / ' + recentCount;
         group.append(sessionDrawer(target + ':recent', '近期空闲会话 · ' + count, recent, info.reachable, prefs.sessions, monitored));
@@ -500,6 +569,7 @@
     catch { if (!state) feedback('等待插件侧栏服务连接'); }
   }
   const onFocus = () => {
+    if (state) update(state);
     if (document.visibilityState !== 'visible' || focusInFlight) return;
     focusInFlight = refresh('focus').finally(() => { focusInFlight = undefined; });
   };
@@ -509,6 +579,11 @@
   };
   byId('pause').onclick = () => state && setPrefs({ paused: !state.prefs.paused });
   byId('notifications').onclick = () => state && setPrefs({ notifications: !state.prefs.notifications });
+  byId('current-only').onclick = () => {
+    if (!currentConversation()) return feedback('请先打开要筛选的 Antigravity 对话');
+    currentOnly = !currentOnly;
+    render();
+  };
   const searchInput = byId('search');
   const clearSearch = byId('clear-search');
   const applySearch = value => {
