@@ -9,8 +9,10 @@ export function cleanPairText(value, limit) {
 }
 
 export function pairConversation(preference, conversationId, now) {
+  const { pairManualUnbound, ...current } = preference;
   return {
-    ...preference,
+    ...current,
+    ...(conversationId === null && { pairManualUnbound: true }),
     pairedConversationId: conversationId,
     pairedConversationTitle: conversationId === preference.pairedConversationId
       ? cleanPairText(preference.pairedConversationTitle, 80) : null,

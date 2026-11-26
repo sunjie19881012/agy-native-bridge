@@ -61,6 +61,22 @@ test('SessionStart 从 stdin 识别对话 ID，空或非法内容安全回退到
   assert.equal(hookConversationId('', {}), undefined);
 });
 
+test('SessionStart 一对多只摘要未隐藏关联总数和最近关联会话', () => {
+  const prefs = { sessions: {
+    'win-codex:earlier': { pairedConversationId: 'fixture_chat', pairedAt: new Date(now - 2000).toISOString() },
+    'win-codex:same-end': { pairedConversationId: 'fixture_chat', pairedAt: new Date(now - 1000).toISOString() },
+    '101-dsh:recent-fixture': { pairedConversationId: 'fixture_chat', pairedAt: new Date(now).toISOString(), pairLabel: '最近评审任务' },
+    '101-codex:hidden-item': { pairedConversationId: 'fixture_chat', hidden: true, pairedAt: new Date(now + 1000).toISOString() },
+    'win-dsh:other-chat': { pairedConversationId: 'other_chat', pairedAt: new Date(now + 2000).toISOString() }
+  } };
+  const result = sessionStartSummary(null, now, { prefs, conversationId: 'fixture_chat' });
+  const message = result.injectSteps[0].systemMessage.systemMessage;
+  assert.match(message, /配对 3 个，最近 101-dsh recent-fixture「最近评审任务」/);
+  assert.match(message, /默认由协作窗口改动、自测.*仅用户明确要求时本端才改代码/);
+  assert.doesNotMatch(message, /earlier|same-end|hidden-item|other-chat/);
+  assert.ok(Array.from(message).length < 100);
+});
+
 test('Antigravity Hook 的实际命令找不到状态时输出空 JSON，doctor 执行真实本地 MCP 握手', () => {
   const hooks = JSON.parse(readFileSync(new URL('../hooks.json', import.meta.url), 'utf8'));
   const hook = hooks['agy-native-bridge'].SessionStart[0];

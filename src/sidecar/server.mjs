@@ -18,6 +18,8 @@ import { applySamples, initialSnapshot, latestQuota, recordDispatch, watchIds } 
 
 const uiPath = new URL('./ui.html', import.meta.url);
 const runtimeName = 'sidecar-runtime.json';
+const activeConversationMs = 10 * 60_000;
+const themeModes = new Set(['auto', 'dark', 'light']);
 const isSession = value => typeof value === 'string' && value.trim() && value.length <= 200;
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const invalidHostIds = body => ['conversationId', 'projectId'].some(key =>
@@ -79,9 +81,24 @@ async function bodyJson(request) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return null; }
 }
 
-function asPrefs(value) {
-  return { paused: value?.paused === true, notifications: value?.notifications === true,
-    sessions: object(value?.sessions) ? value.sessions : {} };
+function asPrefs(value, now) {
+  const migrated = [];
+  const sessions = Object.fromEntries(Object.entries(object(value?.sessions) ? value.sessions : {}).map(([key, pref]) => {
+    if (pref?.pairedConversationId === null && pref.pairManualUnbound !== true) {
+      migrated.push([key, null]);
+      return [key, pairConversation(pref, null, now)];
+    }
+    if (validHostId(pref?.autoReadConversationId) && pref.pairedConversationId === undefined && pref.pairManualUnbound !== true) {
+      migrated.push([key, pref.autoReadConversationId]);
+      return [key, pairConversation(pref, pref.autoReadConversationId, now)];
+    }
+    return [key, pref];
+  }));
+  return {
+    prefs: { paused: value?.paused === true, notifications: value?.notifications === true,
+      theme: themeModes.has(value?.theme) ? value.theme : 'auto', sessions },
+    migrated
+  };
 }
 
 function sessionPreference(body) {
@@ -102,7 +119,9 @@ export async function startSidecar({
   const targets = [...bridgeTargets, ...dshTargets.filter(target => adapters[target])];
   const isTarget = value => targets.includes(value);
   let state = initialSnapshot(previous, targets);
-  let prefs = asPrefs(savedPrefs);
+  const { prefs: normalizedPrefs, migrated } = asPrefs(savedPrefs, clock());
+  let prefs = normalizedPrefs;
+  let activeConversation;
   let writes = Promise.resolve();
   let closing = false;
   const titleLookups = new Map();
@@ -134,6 +153,24 @@ export async function startSidecar({
     if (next === previous) return Promise.resolve();
     prefs = { ...prefs, sessions: { ...prefs.sessions, [key]: next } };
     return save('prefs.json', prefs);
+  }
+  function applyGlobalPreferences(body) {
+    const paused = typeof body.paused === 'boolean' ? body.paused : prefs.paused;
+    if (paused !== prefs.paused) {
+      heartbeat.setPaused(paused);
+      prefs = { ...prefs, paused };
+      if (!paused) autoRead.resume();
+    }
+    prefs = { ...prefs, theme: body.theme ?? prefs.theme,
+      notifications: typeof body.notifications === 'boolean' ? body.notifications : prefs.notifications };
+  }
+
+  function nudgeConversation(body) {
+    if (validHostId(body.conversationId)) return { conversationId: body.conversationId, projectId: body.projectId };
+    const age = activeConversation ? clock() - activeConversation.at : Infinity;
+    if (age >= 0 && age < activeConversationMs) return { conversationId: activeConversation.id };
+    return validHostId(env.ANTIGRAVITY_CONVERSATION_ID)
+      ? { conversationId: env.ANTIGRAVITY_CONVERSATION_ID, projectId: env.ANTIGRAVITY_PROJECT_ID } : {};
   }
   function fillPairTitle(key, conversationId) {
     if (!conversationId || closing) return;
@@ -225,6 +262,10 @@ export async function startSidecar({
       if (!internal && !uiToken && request.headers.origin && !isLoopbackOrigin(request.headers.origin)) {
         return answer(403, { error: 'invalid_origin' });
       }
+      const fromUi = (request.method === 'GET' && ['/api/state', '/api/summary'].includes(url.pathname))
+        || (request.method === 'POST' && ['/api/refresh', '/api/prefs'].includes(url.pathname));
+      const uiConversationId = request.headers['x-agy-conversation-id'];
+      if (fromUi && validHostId(uiConversationId)) activeConversation = { id: uiConversationId, at: clock() };
       if (request.method === 'GET' && url.pathname === '/api/state') return answer(200, view());
       if (request.method === 'GET' && url.pathname === '/api/summary') {
         const target = url.searchParams.get('target');
@@ -249,6 +290,8 @@ export async function startSidecar({
         return answer(200, { ...view(), ...result });
       }
       if (url.pathname === '/api/prefs') {
+        const hasTheme = Object.hasOwn(body, 'theme');
+        if (hasTheme && !themeModes.has(body.theme)) return answer(400, { error: 'invalid_preferences' });
         if (isTarget(body.target) && isSession(body.sessionId)) {
           const key = body.target + ':' + body.sessionId;
           if (invalidHostIds(body)) return answer(400, { error: 'invalid_host_id', message: 'Antigravity 对话或项目 ID 格式无效' });
@@ -261,19 +304,21 @@ export async function startSidecar({
             return answer(400, { error: 'invalid_auto_read_limit', message: '跟进轮数上限必须是 1 到 20 的整数' });
           }
           const current = preference(key);
+          const uiBinding = validHostId(body.conversationId) ? body
+            : { conversationId: validHostId(uiConversationId) ? uiConversationId : undefined };
           let pairId = body.pairedConversationId;
           if (body.pairCurrent === true) {
-            if (!validHostId(body.conversationId)) {
+            if (!uiBinding.conversationId) {
               return answer(400, { error: 'missing_conversation_id', message: '请先打开要绑定的 Antigravity 对话' });
             }
-            pairId = body.conversationId;
+            pairId = uiBinding.conversationId;
           } else if (body.pairCurrent === false) pairId = null;
           let automatic = {};
-          if (body.autoRead === true && current.autoRead !== true) {
-            const destination = findBinding(body, current, env);
-            if (!destination) return answer(400, { error: 'missing_conversation_id', message: missingBinding });
-            automatic = enableAutoRead(current, destination);
-            if (pairId === undefined) pairId = destination.conversationId;
+          if (body.autoRead === true) {
+            const destination = findBinding(uiBinding, current, env);
+            if (!destination && current.autoRead !== true) return answer(400, { error: 'missing_conversation_id', message: missingBinding });
+            if (current.autoRead !== true) automatic = enableAutoRead(current, destination);
+            if (pairId === undefined) pairId = destination?.conversationId;
           } else if (body.autoRead === false) {
             automatic = { autoRead: false, autoReadRunId: null, autoReadError: null };
           }
@@ -284,6 +329,7 @@ export async function startSidecar({
                 autoReadError: '跟进轮数已达到新上限，自动读取已关闭' });
             }
           }
+          applyGlobalPreferences(body);
           await updatePreference(key, prior => {
             const changed = { ...prior, ...automatic, ...sessionPreference(body) };
             if (body.pairLabel !== undefined) changed.pairLabel = cleanPairText(body.pairLabel, 32);
@@ -292,13 +338,10 @@ export async function startSidecar({
           fillPairTitle(key, pairId);
           autoRead.changed(key);
         } else {
-          if (typeof body.paused !== 'boolean' && typeof body.notifications !== 'boolean') return answer(400, { error: 'invalid_preferences' });
-          prefs = {
-            ...prefs, paused: typeof body.paused === 'boolean' ? body.paused : prefs.paused,
-            notifications: typeof body.notifications === 'boolean' ? body.notifications : prefs.notifications
-          };
-          heartbeat.setPaused(prefs.paused);
-          if (!prefs.paused) autoRead.resume();
+          if (!hasTheme && typeof body.paused !== 'boolean' && typeof body.notifications !== 'boolean') {
+            return answer(400, { error: 'invalid_preferences' });
+          }
+          applyGlobalPreferences(body);
           await save('prefs.json', prefs);
         }
         return answer(200, view());
@@ -308,22 +351,27 @@ export async function startSidecar({
           return answer(400, { error: 'invalid_action' });
         }
         if (invalidHostIds(body)) return answer(400, { error: 'invalid_host_id' });
+        const destination = nudgeConversation(body);
+        const key = body.target + ':' + body.sessionId;
         if (body.action === 'read') {
           await markRead(body);
+          const current = preference(key);
+          if (destination.conversationId && !current.pairedConversationId && current.pairManualUnbound !== true) {
+            await updatePreference(key, prior => pairConversation(prior, destination.conversationId, clock()));
+            fillPairTitle(key, destination.conversationId);
+          }
           return answer(202, { ok: true });
         }
         let missingConversation = false;
-        if ((body.action === 'send' || body.action === 'create') && (body.conversationId || body.autoReadOnFinish === true)) {
-          const key = body.target + ':' + body.sessionId;
-          let pairId = body.conversationId || undefined;
+        if ((body.action === 'send' || body.action === 'create') && (destination.conversationId || body.autoReadOnFinish === true)) {
+          const pairId = destination.conversationId;
           await updatePreference(key, prior => {
-            let next = body.conversationId ? { ...prior, lastDispatchConversationId: body.conversationId,
-              lastDispatchProjectId: body.projectId || null } : prior;
+            let next = pairId ? { ...prior, lastDispatchConversationId: pairId,
+              lastDispatchProjectId: validHostId(destination.projectId) ? destination.projectId : null } : prior;
             if (body.action === 'send' && body.autoReadOnFinish === true && !next.autoRead && !next.autoReadLimitReached) {
-              const destination = findBinding(body, next, env);
-              missingConversation = !destination;
-              next = destination ? enableAutoRead(next, destination) : { ...next, autoReadError: missingBinding };
-              pairId ??= destination?.conversationId;
+              const binding = findBinding(destination, next, env);
+              missingConversation = !binding;
+              next = binding ? enableAutoRead(next, binding) : { ...next, autoReadError: missingBinding };
             }
             return pairId ? pairConversation(next, pairId, clock()) : next;
           });
@@ -354,11 +402,13 @@ export async function startSidecar({
   const address = server.address();
   selectedPort = typeof address === 'object' ? address.port : port;
   try {
+    if (migrated.length) await save('prefs.json', prefs);
     await save(runtimeName, { port: selectedPort, pid: process.pid, updatedAt: new Date(clock()).toISOString(), nudgeToken });
   } catch (error) {
     server.close();
     throw error;
   }
+  for (const [key, conversationId] of migrated) fillPairTitle(key, conversationId);
   heartbeat.start();
   let closePromise;
   return {

@@ -48,8 +48,12 @@ function pairedSummary(snapshot, prefs, conversationId) {
   sessions.sort((a, b) => b.pairedAt - a.pairedAt);
   if (!sessions.length) return null;
   const { target, sessionId, label } = sessions[0];
-  const reference = sessionId.length <= 56 ? sessionId : sessionId.slice(0, 55) + '…';
-  return '配对 ' + target + ' ' + reference + (label ? '「' + label + '」' : '')
+  const multiple = sessions.length > 1;
+  const referenceLimit = multiple ? 44 : 56;
+  const reference = sessionId.length <= referenceLimit ? sessionId : sessionId.slice(0, referenceLimit - 1) + '…';
+  const shortLabel = multiple && label ? Array.from(label).slice(0, 8).join('') : label;
+  const prefix = multiple ? '配对 ' + sessions.length + ' 个，最近 ' : '配对 ';
+  return prefix + target + ' ' + reference + (shortLabel ? '「' + shortLabel + '」' : '')
     + '。默认由协作窗口改动、自测；仅用户明确要求时本端才改代码。';
 }
 

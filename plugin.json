@@ -1,6 +1,7 @@
 {
   "name": "agy-native-bridge",
   "displayName": "agy-native-bridge",
+  "logo": "logo.svg",
   "version": "0.1.0",
   "description": "在 Antigravity 中查看 Windows 和 101 上的 Codex 原生会话并派发任务。"
 }

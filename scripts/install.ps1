@@ -18,7 +18,7 @@ if ($LASTEXITCODE -ne 0 -or $nodeVersion -lt [version]'22.13.0') {
     throw '需要 Node.js 22.13 或更高版本。'
 }
 
-$files = @('README.md', 'package.json', 'package-lock.json', 'plugin.json', 'mcp_config.json', 'hooks.json',
+$files = @('README.md', 'package.json', 'package-lock.json', 'plugin.json', 'logo.svg', 'mcp_config.json', 'hooks.json',
     'scripts/doctor.ps1', 'scripts/101-turn-watcher.mjs', 'scripts/101-local-relay.mjs')
 foreach ($directory in @('src', 'skills', 'sidecars', 'configs', 'docs')) {
     $files += Get-ChildItem -LiteralPath (Join-Path $source $directory) -Recurse -File |
