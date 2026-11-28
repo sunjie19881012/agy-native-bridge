@@ -8,6 +8,7 @@ import { setImmediate as flush } from 'node:timers/promises';
 import test from 'node:test';
 import { sendHostMessage } from '../src/sidecar/auto-read.mjs';
 import { readConversationTitle } from '../src/sidecar/conversation-title.mjs';
+import { recentUnreadMs } from '../src/sidecar/heartbeat.mjs';
 import { startSidecar } from '../src/sidecar/server.mjs';
 
 const target = '101-codex';
@@ -151,7 +152,7 @@ test('从 catalog 读取空闲会话的最近一轮，未知会话不会触发�
   assert.equal(f.reads.length, 1);
 });
 
-test('侧栏优先用监控状态去重，目录空闲会话进入抽屉并限制显示 20 条', () => {
+test('侧栏优先用监控状态去重，只将需要关注的会话放在焦点区', () => {
   const html = readFileSync(new URL('../src/sidecar/ui.html', import.meta.url), 'utf8');
   const script = html.split('<script>')[1].split('</script>')[0];
   const start = script.indexOf('  function groupSessions(');
@@ -160,7 +161,7 @@ test('侧栏优先用监控状态去重，目录空闲会话进入抽屉并限�
   const idle = Array.from({ length: 22 }, (_, i) => ({ sessionId: 'idle-' + i, state: 'idle' }));
   const info = {
     sessions: [{ sessionId: 'duplicate', state: 'active' }, { sessionId: 'unread', state: 'idle',
-      outcome: 'completed', unread: { kind: 'completed' } }],
+      outcome: 'completed', unread: { kind: 'completed', at: Date.now() } }, { sessionId: 'monitor-idle', state: 'idle' }],
     catalog: { sessions: [
       ...idle, { sessionId: 'duplicate', state: 'idle' }, { sessionId: 'approval', state: 'waiting_approval' },
       { sessionId: 'star', state: 'idle' }, { sessionId: 'hidden', state: 'idle' }
@@ -171,13 +172,13 @@ test('侧栏优先用监控状态去重，目录空闲会话进入抽屉并限�
     ['approval', 'waiting_approval'], ['duplicate', 'active'], ['unread', 'idle'], ['star', 'idle']
   ]);
   assert.deepEqual(grouped.hidden.map(row => row.sessionId), ['hidden']);
-  assert.equal(grouped.recentCount, 22);
-  assert.equal(grouped.recent.length, 20);
-  assert.equal(grouped.total, 27);
-  assert.equal(groups({ sessions: [], catalog: { sessions: idle } }, () => ({})).recent.length, 20);
+  assert.equal(grouped.recent.length, 23);
+  assert.equal(grouped.recent[0].sessionId, 'monitor-idle');
+  assert.equal(grouped.total, 28);
+  assert.equal(groups({ sessions: [], catalog: { sessions: idle } }, () => ({})).recent.length, 22);
 });
 
-test('侧栏模糊搜索支持多词子串与顺序模糊匹配，并能搜出 20 条上限之后的会话', () => {
+test('侧栏模糊搜索支持多词子串与顺序模糊匹配，并能搜出近期列表上限之后的会话', () => {
   const html = readFileSync(new URL('../src/sidecar/ui.html', import.meta.url), 'utf8');
   const script = html.split('<script>')[1].split('</script>')[0];
   const start = script.indexOf('  function groupSessions(');
@@ -185,7 +186,7 @@ test('侧栏模糊搜索支持多词子串与顺序模糊匹配，并能搜出 2
   const { groupSessions, matchesQuery } = new Function(script.slice(start, end) + '\nreturn { groupSessions, matchesQuery };')();
   const tail = { sessionId: 'tail-recipe-id', title: '推进 Sample Recipe 分析任务', workspacePath: '/home/user/work/task', state: 'unknown' };
   const hidden = { sessionId: 'hidden-recipe-id', title: '已隐藏 Sample 任务', workspacePath: '/home/user/work/task', state: 'unknown' };
-  const padding = Array.from({ length: 24 }, (_, i) => ({ sessionId: 'pad-' + i, title: '无关会话 ' + i, workspacePath: '/tmp', state: 'unknown' }));
+  const padding = Array.from({ length: 30 }, (_, i) => ({ sessionId: 'pad-' + i, title: '无关会话 ' + i, workspacePath: '/tmp', state: 'unknown' }));
   const info = { sessions: [], catalog: { sessions: [...padding, tail, hidden] } };
   const pref = row => ({ hidden: row.sessionId === 'hidden-recipe-id' });
 
@@ -218,6 +219,9 @@ test('Sidecar 声明是 AUX_PANE，HTTP 服务保护运行时、状态和偏好'
   assert.deepEqual(manifest.args, ['entry.mjs']);
   assert.equal(manifest.has_web_ui, true);
   assert.equal(manifest.restart_policy, 'always');
+  assert.equal(manifest.display_name, '原生会话');
+  assert.equal(manifest.ui_config.display_name, '原生会话');
+  assert.equal(manifest.ui_config.views[0].title, '原生会话');
   assert.equal(manifest.ui_config.views[0].entrypoint, 'SIDECAR_UI_ENTRYPOINT_AUX_PANE');
 
   const f = await fixture(t);
@@ -228,6 +232,8 @@ test('Sidecar 声明是 AUX_PANE，HTTP 服务保护运行时、状态和偏好'
   assert.ok(runtime.updatedAt);
   const page = await f.request('GET', '/');
   assert.equal(page.status, 200);
+  assert.match(page.body, /<title>原生会话<\/title>/);
+  assert.match(page.body, /<h1>原生会话<\/h1>/);
   assert.match(page.body, /prefers-color-scheme: dark/);
   assert.doesNotThrow(() => new Function(page.body.split('<script>')[1].split('</script>')[0]));
   assert.equal((await f.request('GET', '/api/state', undefined, { 'X-Sidecar-Token': 'wrong' })).status, 401);
@@ -461,6 +467,89 @@ test('合法侧栏报到为缺少对话 ID 的发送、新建和读取建立同�
   assert.equal(paired('expired').pairedConversationId, 'env_chat');
 });
 
+test('隐式派发和新建保留原配对，自动读取使用已绑定对话，显式派发仍可换绑', async t => {
+  const lookups = [];
+  const f = await fixture(t, {}, undefined, {
+    env: { ANTIGRAVITY_CONVERSATION_ID: 'env_chat', ANTIGRAVITY_PROJECT_ID: 'env_project' },
+    lookupTitle: async conversationId => { lookups.push(conversationId); return 'Fixture ' + conversationId; }
+  });
+  const headers = { 'X-Bridge-Token': f.files.get(runtimeName).nudgeToken };
+  const nudge = (action, fields = {}) =>
+    f.request('POST', '/api/nudge', { target, sessionId: id, workspacePath: '/mock', action, ...fields }, headers);
+  assert.equal((await nudge('send', { conversationId: 'chat_a', projectId: 'project_a' })).status, 202);
+  await flush();
+  const original = autoReadPref(f);
+  assert.equal(original.pairedConversationTitle, 'Fixture chat_a');
+  f.tick(1000);
+  await f.request('GET', '/api/state', undefined, { 'X-Agy-Conversation-Id': 'chat_b' });
+  for (const [action, fields] of [['send', { mode: 'queue' }], ['send', { mode: 'steer' }], ['create', {}]]) {
+    assert.equal((await nudge(action, fields)).status, 202);
+    assert.deepEqual(autoReadPref(f), original);
+  }
+  f.tick(10 * 60_000);
+  assert.equal((await nudge('send', { mode: 'steer', autoReadOnFinish: true })).status, 202);
+  const enabled = autoReadPref(f);
+  assert.equal(enabled.autoRead, true);
+  assert.equal(enabled.autoReadConversationId, 'chat_a');
+  assert.equal(enabled.autoReadProjectId, 'project_a');
+  assert.equal(enabled.pairedConversationId, original.pairedConversationId);
+  assert.equal(enabled.pairedAt, original.pairedAt);
+  assert.equal(enabled.lastDispatchConversationId, original.lastDispatchConversationId);
+  assert.equal(enabled.lastDispatchProjectId, original.lastDispatchProjectId);
+  assert.deepEqual(lookups, ['chat_a']);
+
+  assert.equal((await nudge('send', { conversationId: 'explicit_chat', projectId: 'explicit_project' })).status, 202);
+  await flush();
+  assert.equal(autoReadPref(f).pairedConversationId, 'explicit_chat');
+  assert.equal(autoReadPref(f).lastDispatchConversationId, 'explicit_chat');
+  assert.equal(autoReadPref(f).lastDispatchProjectId, 'explicit_project');
+  assert.equal(autoReadPref(f).pairedConversationTitle, 'Fixture explicit_chat');
+  assert.deepEqual(lookups, ['chat_a', 'explicit_chat']);
+});
+
+test('未配对会话重新派发时优先恢复已授权的自动读取对话', async t => {
+  const f = await fixture(t);
+  const headers = { 'X-Bridge-Token': f.files.get(runtimeName).nudgeToken };
+  await autoReadSetting(f, { autoRead: true, conversationId: 'wake_chat', projectId: 'wake_project' });
+  for (const action of ['send', 'create']) {
+    await autoReadSetting(f, { pairCurrent: false });
+    if (action === 'create') {
+      await f.request('GET', '/api/state', undefined, { 'X-Agy-Conversation-Id': 'chat_b' });
+    }
+    const response = await f.request('POST', '/api/nudge', { target, sessionId: id, workspacePath: '/mock', action }, headers);
+    assert.equal(response.status, 202);
+    assert.equal(autoReadPref(f).pairedConversationId, 'wake_chat');
+    assert.equal(autoReadPref(f).lastDispatchConversationId, 'wake_chat');
+    assert.equal(autoReadPref(f).lastDispatchProjectId, 'wake_project');
+    assert.equal(Object.hasOwn(autoReadPref(f), 'pairManualUnbound'), false);
+  }
+});
+
+test('后台状态轮询不抢占或续期活跃对话，前台状态和偏好请求仍可报到', async t => {
+  const f = await fixture(t, {}, undefined, { env: { ANTIGRAVITY_CONVERSATION_ID: 'env_chat' } });
+  const headers = { 'X-Bridge-Token': f.files.get(runtimeName).nudgeToken };
+  const checkIn = (conversationId, extra = {}) =>
+    f.request('GET', '/api/state', undefined, { 'X-Agy-Conversation-Id': conversationId, ...extra });
+  const checkPair = async (sessionId, expected) => {
+    const response = await f.request('POST', '/api/nudge', { target, sessionId, action: 'create' }, headers);
+    assert.equal(response.status, 202);
+    assert.equal(f.files.get('prefs.json').sessions[target + ':' + sessionId].pairedConversationId, expected);
+  };
+  assert.equal((await checkIn('chat_a')).status, 200);
+  f.tick(10 * 60_000 - 1);
+  const background = { 'X-Agy-Background-Poll': '1' };
+  assert.equal((await checkIn('chat_b', background)).status, 200);
+  await checkPair('after-background', 'chat_a');
+  f.tick(1);
+  await checkPair('expired', 'env_chat');
+  assert.equal((await checkIn('chat_b')).status, 200);
+  await checkPair('after-foreground', 'chat_b');
+  const preferences = await f.request('POST', '/api/prefs', { theme: 'auto' },
+    { 'X-Agy-Conversation-Id': 'chat_c', ...background });
+  assert.equal(preferences.status, 200);
+  await checkPair('after-preferences', 'chat_c');
+});
+
 test('手动解绑保护会话免于读取重绑，手动绑定、派发或开启自动读取可解除保护', async t => {
   const f = await fixture(t);
   const checkIn = { 'X-Agy-Conversation-Id': 'active_chat' };
@@ -559,7 +648,7 @@ test('ConversationService 标题只读查询限制为本机，优先 annotations
 
 function cardFixture() {
   const html = readFileSync(new URL('../src/sidecar/ui.html', import.meta.url), 'utf8');
-  const code = html.slice(html.indexOf('  function card('), html.indexOf('  function sessionDrawer('));
+  const code = html.slice(html.indexOf('  function copyButton('), html.indexOf('  function sessionDrawer('));
   const labelsCode = html.slice(html.indexOf('  const labels ='), html.indexOf('  const byId ='));
   const el = (tag, className, text) => ({
     tag, className, text, children: [], append(...nodes) { this.children.push(...nodes); }, setAttribute() {}, addEventListener() {}
@@ -633,17 +722,18 @@ function testNode(tag) {
 }
 
 async function panelFixture(snapshot, conversationId, { systemDark = false, cachedTheme, saveTheme = async () => true,
-  summary, clipboard } = {}) {
+  summary, clipboard, focused = true, now = Date.now } = {}) {
   const html = readFileSync(new URL('../src/sidecar/ui.html', import.meta.url), 'utf8');
   const ids = ['sync-status', 'synced', 'usage', 'refresh', 'pause', 'notifications', 'theme-toggle', 'current-only',
-    'outside-approvals', 'feedback', 'targets', 'search', 'clear-search'];
+    'target-tabs', 'outside-approvals', 'feedback', 'targets', 'search', 'clear-search'];
   const nodes = new Map(ids.map(id => [id, testNode(id)]));
   const get = id => nodes.get(id);
   const requests = [];
   const storage = new Map(cachedTheme ? [['agy-native-bridge.theme', cachedTheme]] : []);
   const media = { matches: systemDark, addEventListener(name, fn) { this[name] = fn; } };
+  const events = {};
   const window = {
-    addEventListener() {},
+    addEventListener(name, fn) { events[name] = fn; },
     localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) },
     matchMedia: () => media,
     sidecar: {
@@ -660,17 +750,22 @@ async function panelFixture(snapshot, conversationId, { systemDark = false, cach
       }
     }
   };
-  const document = { getElementById: get, createElement: testNode, addEventListener() {},
+  const document = { getElementById: get, createElement: testNode, addEventListener() {}, visibilityState: 'visible',
+    hasFocus: () => focused,
     documentElement: { dataset: {} }, createElementNS: (ns, tag) => Object.assign(testNode(tag), { namespaceURI: ns }) };
   const startup = html.match(/<script id="theme-startup">([\s\S]*?)<\/script>/)[1];
   new Function('window', 'document', startup)(window, document);
   const startupTheme = document.documentElement.dataset.theme;
   const script = html.split('<script>')[1].split('</script>')[0];
-  const { update, request } = new Function('window', 'document', 'location', 'navigator', 'setInterval', 'setTimeout', 'clearTimeout',
-    script + '\nreturn { update, request };')(window, document, { search: '' }, { clipboard }, () => {}, () => {}, () => {});
+  class FixtureDate extends Date { static now() { return now(); } }
+  let timer;
+  const setInterval = (poll, delay) => { timer = { poll, delay }; };
+  const { update, request } = new Function('window', 'document', 'location', 'navigator', 'Date', 'setInterval', 'setTimeout', 'clearTimeout',
+    script + '\nreturn { update, request };')(window, document, { search: '' }, { clipboard }, FixtureDate, setInterval, () => {}, () => {});
   await flush();
   return {
-    get, requests, request, storage, startupTheme, theme: () => document.documentElement.dataset.theme,
+    get, requests, request, storage, startupTheme, timer, events, theme: () => document.documentElement.dataset.theme,
+    setFocused(value) { focused = value; },
     setSystemDark(dark) { media.matches = dark; media.change?.(); },
     update(next = snapshot) { snapshot = next; update(snapshot); },
     switchConversation(id) { window.sidecar.conversationId = id; update(snapshot); }
@@ -706,7 +801,8 @@ test('关联多个会话时默认聚焦当前对话，手动切换跨刷新保�
   const scope = f.get('current-only');
   const root = f.get('targets');
   const reminder = f.get('outside-approvals');
-  const groups = () => root.children.map(group => group.children[0].children[0].textContent);
+  const tabs = f.get('target-tabs');
+  const groups = () => root.children.filter(group => group.tag === 'section').map(group => group.children[0].children[0].textContent);
   const cards = () => root.children.flatMap(group => group.children.filter(node => node.tag === 'article'))
     .map(card => card.children[0].children[0].children[1].textContent);
   const quota = f.get('usage').children;
@@ -716,15 +812,17 @@ test('关联多个会话时默认聚焦当前对话，手动切换跨刷新保�
   assert.equal(scope.attributes['aria-pressed'], 'true');
   assert.deepEqual(groups(), ['win-codex', '101-dsh']);
   assert.deepEqual(cards(), ['first', 'second', 'third']);
+  assert.equal(tabs.hidden, true);
   assert.equal(reminder.hidden, false);
   assert.equal(reminder.textContent, '其他对话有 1 个待审批 · 查看全部');
 
   scope.onclick();
   assert.equal(scope.textContent, '仅看当前对话');
+  assert.equal(tabs.hidden, false);
   assert.equal(reminder.hidden, true);
   f.update({ ...fixture, sampledAt: new Date(2000).toISOString() });
   assert.equal(scope.attributes['aria-pressed'], 'false');
-  assert.equal(groups().length, 3);
+  assert.deepEqual(groups(), ['win-codex']);
 
   f.switchConversation('chat_b');
   assert.equal(scope.textContent, '仅当前 (1)');
@@ -732,7 +830,7 @@ test('关联多个会话时默认聚焦当前对话，手动切换跨刷新保�
   assert.equal(reminder.hidden, true);
   f.switchConversation('unpaired_chat');
   assert.equal(scope.attributes['aria-pressed'], 'false');
-  assert.equal(groups().length, 3);
+  assert.deepEqual(groups(), ['win-codex']);
   f.switchConversation('chat_a');
   assert.equal(scope.attributes['aria-pressed'], 'false');
   scope.onclick();
@@ -744,12 +842,167 @@ test('关联多个会话时默认聚焦当前对话，手动切换跨刷新保�
   fallback.events.click();
   assert.equal(search.value, '');
   assert.equal(scope.attributes['aria-pressed'], 'false');
+  assert.equal(groups().length, 3);
 
   scope.onclick();
   reminder.onclick();
   assert.equal(reminder.hidden, true);
+  assert.equal(tabs.children[0].attributes['aria-pressed'], 'true');
   assert.ok(cards().includes('approval'));
   assert.deepEqual(f.requests.map(([route]) => route), ['/api/state']);
+});
+
+test('未绑定的对话把其他对话的完成、活动和空闲会话收进抽屉，搜索可以命中', async () => {
+  const target = 'win-codex';
+  const now = 1_000_000;
+  const finished = { ...panelRow(target, 'other-completed'), outcome: 'completed', unread: { kind: 'completed', at: now } };
+  const idle = panelRow(target, 'other-idle');
+  const active = panelRow(target, 'other-active', 'active');
+  const approval = panelRow(target, 'other-approval', 'waiting_approval');
+  const expired = { ...panelRow(target, 'expired-reply'), outcome: 'failed',
+    unread: { kind: 'failed', at: now - recentUnreadMs - 1 } };
+  const snapshot = {
+    targets: { [target]: panelTarget([finished, active, expired], [idle]) },
+    prefs: { sessions: Object.fromEntries([finished, idle, active, approval].map(row => [target + ':' + row.sessionId,
+      { pairedConversationId: 'other_chat', pairLabel: '另一个任务' }])) }
+  };
+  const f = await panelFixture(snapshot, 'unpaired_chat', { now: () => now });
+  const root = f.get('targets');
+  const group = () => root.children.find(node => node.tag === 'section');
+  const cards = () => group().children.filter(node => node.tag === 'article');
+  assert.equal(f.get('target-tabs').hidden, true);
+  assert.equal(root.children[0].textContent, '当前对话未绑定会话 · 可从下方快速绑定或右键复制引用');
+  assert.equal(cards().length, 0);
+  assert.match(group().children.find(node => node.className === 'compact-row').textContent, /expired-reply/);
+  const drawer = group().children.find(node => node.tag === 'details');
+  assert.equal(drawer.open, false);
+  assert.equal(drawer.children[0].textContent, '其他对话已绑定 · 3');
+  assert.match(drawer.textContent, /other-completed.*other-idle/);
+  assert.match(drawer.textContent, /other-active/);
+  assert.match(drawer.textContent, /其他对话 · 另一个任务/);
+
+  const search = f.get('search');
+  search.value = 'other-idle';
+  search.events.input();
+  assert.equal(cards().length, 1);
+  assert.match(cards()[0].textContent, /other-idle/);
+  assert.equal(group().children.some(node => node.tag === 'details'), false);
+
+  f.get('clear-search').events.click();
+  f.update({ ...snapshot, targets: { [target]: panelTarget([finished, active, expired, approval], [idle]) } });
+  assert.equal(cards().length, 1);
+  assert.match(cards()[0].textContent, /other-approval.*等待原窗口审批/);
+  assert.equal(root.children.some(node => node.className === 'scope-hint muted'), false);
+});
+
+test('同一快照跨过未读时限后，侧栏在下次轮询将终态会话移入近期列表', async () => {
+  const target = 'win-codex';
+  const at = 1_000_000;
+  let now = at + recentUnreadMs;
+  const row = { ...panelRow(target, 'aging-reply'), outcome: 'completed', unread: { kind: 'completed', at } };
+  const snapshot = { targets: { [target]: panelTarget([row]) }, prefs: { paused: true, sessions: {} } };
+  const f = await panelFixture(snapshot, 'fixture_chat', { now: () => now });
+  const group = () => f.get('targets').children.find(node => node.tag === 'section');
+  assert.match(group().textContent, /已完成 · 新回复/);
+  now++;
+  await f.timer.poll();
+  await flush();
+  assert.doesNotMatch(group().textContent, /新回复/);
+  assert.equal(group().children.find(node => node.className === 'compact-row').children[0].title, '已完成');
+});
+
+test('目标 Tab 按已配置端排序，有活动默认单端，未手动选择时搜索跨端', async () => {
+  const win = 'win-codex';
+  const linux = '101-codex';
+  const winDsh = 'win-dsh';
+  const linuxDsh = '101-dsh';
+  const activity = [panelRow(linux, 'active-linux', 'active'), panelRow(linux, 'approval-linux', 'waiting_approval')];
+  const snapshot = {
+    prefs: { sessions: {} },
+    targets: {
+      [linuxDsh]: { ...panelTarget([]), reachable: false },
+      [winDsh]: { ...panelTarget([]), reachable: false, sampledAt: new Date(1000).toISOString() },
+      [linux]: panelTarget(activity, [panelRow(linux, 'approval-linux')]),
+      [win]: panelTarget([], [panelRow(win, 'cross-target-search')])
+    }
+  };
+  const f = await panelFixture(snapshot, 'fixture_chat');
+  const nav = f.get('target-tabs');
+  const tabLabel = node => node.children.find(child => !child.className).textContent;
+  const tab = label => nav.children.find(node => tabLabel(node) === label);
+  const selected = () => tabLabel(nav.children.find(node => node.attributes['aria-pressed'] === 'true'));
+  const groups = () => f.get('targets').children.filter(node => node.tag === 'section')
+    .map(node => node.children[0].children[0].textContent);
+  assert.equal(nav.hidden, false);
+  assert.deepEqual(nav.children.map(tabLabel), ['全部', win, linux, winDsh, linuxDsh]);
+  assert.equal(selected(), linux);
+  assert.deepEqual(groups(), [linux]);
+  assert.equal(tab(linux).children[0].className, 'tab-dot attention');
+  assert.equal(tab(linux).children.at(-1).textContent, '2');
+  assert.equal(tab(winDsh).children[0].className, 'tab-dot offline');
+  assert.equal(tab(linuxDsh).children.length, 1);
+  f.update({ ...snapshot, targets: { ...snapshot.targets, [linux]: panelTarget(activity.slice(0, 1)) } });
+  assert.equal(tab(linux).children[0].className, 'tab-dot');
+
+  const search = f.get('search');
+  search.value = 'cross-target-search';
+  search.events.input();
+  assert.equal(selected(), '全部');
+  assert.match(f.get('targets').textContent, /cross-target-search/);
+  f.get('clear-search').events.click();
+  assert.equal(selected(), linux);
+  tab(winDsh).events.click();
+  assert.equal(selected(), winDsh);
+  assert.deepEqual(groups(), [winDsh]);
+  f.update({ ...snapshot, sampledAt: new Date(2000).toISOString() });
+  assert.equal(selected(), winDsh);
+  tab('全部').events.click();
+  assert.deepEqual(groups(), [win, linux, winDsh, linuxDsh]);
+
+  const empty = await panelFixture({ ...snapshot, targets: { ...snapshot.targets, [linux]: panelTarget([]) } }, 'fixture_chat');
+  assert.equal(tabLabel(empty.get('target-tabs').children.find(node => node.attributes['aria-pressed'] === 'true')), win);
+  const dual = await panelFixture({ ...snapshot, targets: { [linux]: snapshot.targets[linux], [win]: snapshot.targets[win] } }, '');
+  assert.equal(tabLabel(dual.get('target-tabs').children.find(node => node.attributes['aria-pressed'] === 'true')), '全部');
+});
+
+test('近期会话前 8 条直接展示，余项折叠，紧凑行可绑定、复制与展开', async () => {
+  const target = 'win-codex';
+  const rows = Array.from({ length: 31 }, (_, index) => panelRow(target, 'idle-' + index));
+  const first = rows[0];
+  const snapshot = { prefs: { sessions: {} }, targets: { [target]: panelTarget([], rows) } };
+  const copied = [];
+  const f = await panelFixture(snapshot, 'fixture_chat', { clipboard: { writeText: async text => copied.push(text) } });
+  const group = () => f.get('targets').children.find(node => node.tag === 'section');
+  const compact = () => group().children.filter(node => node.className === 'compact-row');
+  const more = group().children.find(node => node.tag === 'details');
+  assert.equal(compact().length, 8);
+  assert.equal(more.open, false);
+  assert.equal(more.children[0].textContent, '更多近期会话 · 23');
+  assert.equal(more.children.slice(1).filter(node => node.className === 'compact-row').length, 20);
+  const [, main, actions] = compact()[0].children;
+  assert.equal(main.children[0].title, first.title);
+  assert.equal(main.children[1].textContent, 'workspace');
+  assert.equal(main.children[1].title, first.workspacePath);
+  assert.deepEqual(actions.children.map(node => node.textContent), ['绑定', '引用', '展开']);
+  const [bind, copy, expand] = actions.children;
+  await bind.events.click();
+  assert.equal(f.requests.at(-1)[0], '/api/prefs');
+  assert.deepEqual(JSON.parse(f.requests.at(-1)[1].body),
+    { target, sessionId: first.sessionId, pairCurrent: true, conversationId: 'fixture_chat' });
+  await copy.events.click();
+  assert.deepEqual(JSON.parse(copied.at(-1)), { target, sessionId: first.sessionId, expectedWorkspace: first.workspacePath });
+  let prevented = false;
+  await copy.events.contextmenu({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(copied.at(-1), '请使用 win-codex 会话 idle-0（标题：idle-0，工作区：/mock/workspace）：');
+  expand.events.click();
+  assert.equal(compact().length, 7);
+  f.update({ ...snapshot, sampledAt: new Date(2000).toISOString() });
+  const card = group().children.find(node => node.tag === 'article');
+  assert.match(card.textContent, /idle-0.*读取会话.*复制引用/);
+  const tools = card.children.find(node => node.className === 'actions').children[1];
+  tools.children.find(node => node.textContent === '收起').events.click();
+  assert.equal(compact().length, 8);
 });
 
 test('侧栏每种请求附上合法的当前对话，切窗即时更新，非法 ID 省略', async () => {
@@ -763,6 +1016,36 @@ test('侧栏每种请求附上合法的当前对话，切窗即时更新，非�
   f.switchConversation('--invalid');
   await f.request('/api/prefs', { paused: true });
   assert.equal(Object.hasOwn(f.requests.at(-1)[1].headers, 'X-Agy-Conversation-Id'), false);
+});
+
+test('侧栏只给非聚焦窗口的 5 秒状态轮询添加后台请求头', async () => {
+  const snapshot = { maxAutoReads: 5, prefs: { sessions: {} }, targets: {} };
+  const f = await panelFixture(snapshot, 'fixture_chat', { focused: false });
+  const headers = () => f.requests.at(-1)[1].headers;
+  const noBackground = () => assert.equal(Object.hasOwn(headers(), 'X-Agy-Background-Poll'), false);
+  assert.equal(f.timer.delay, 5000);
+  noBackground();
+  f.timer.poll();
+  await flush();
+  assert.equal(f.requests.at(-1)[0], '/api/state');
+  assert.equal(headers()['X-Agy-Conversation-Id'], 'fixture_chat');
+  assert.equal(headers()['X-Agy-Background-Poll'], '1');
+  await f.get('refresh').onclick();
+  assert.equal(f.requests.at(-1)[0], '/api/refresh?reason=manual');
+  noBackground();
+  await f.get('pause').onclick();
+  assert.equal(f.requests.at(-1)[0], '/api/prefs');
+  noBackground();
+
+  f.setFocused(true);
+  f.events.focus();
+  await flush();
+  assert.equal(f.requests.at(-1)[0], '/api/refresh?reason=focus');
+  noBackground();
+  f.timer.poll();
+  await flush();
+  assert.equal(f.requests.at(-1)[0], '/api/state');
+  noBackground();
 });
 
 test('主题使用本地缓存首帧和 Sidecar 权威值，三态切换即时预览且失败回滚', async () => {
@@ -827,14 +1110,18 @@ test('主题使用本地缓存首帧和 Sidecar 权威值，三态切换即时�
   assert.deepEqual(f.requests.slice(1).map(([, options]) => JSON.parse(options.body).theme), ['dark', 'light', 'auto', 'light']);
 });
 
-test('更多面板收纳配对、标签和隐藏，展开后跨刷新保留', async () => {
+test('其他对话卡片的更多面板收纳配对、标签和隐藏，展开后跨刷新保留', async () => {
   const row = panelRow('win-codex', 'fixture-card', 'active');
   const snapshot = {
     sampledAt: new Date(1000).toISOString(), maxAutoReads: 5, targets: { 'win-codex': panelTarget([row]) },
     prefs: { sessions: { 'win-codex:fixture-card': { pairedConversationId: 'other_chat', starred: true } } }
   };
   const f = await panelFixture(snapshot, 'current_chat');
-  const card = () => f.get('targets').children[0].children.find(node => node.tag === 'article');
+  const drawer = () => f.get('targets').children.find(node => node.tag === 'section').children.find(node => node.tag === 'details');
+  assert.equal(drawer().open, false);
+  drawer().open = true;
+  drawer().events.toggle();
+  const card = () => drawer().children.find(node => node.tag === 'article');
   const primary = card().children.find(node => node.className === 'actions').children[0];
   const secondary = card().children.find(node => node.className === 'actions').children[1];
   assert.deepEqual(primary.children.map(node => node.textContent), ['读取会话', '复制引用', '自动读取']);
@@ -849,6 +1136,7 @@ test('更多面板收纳配对、标签和隐藏，展开后跨刷新保留', as
   assert.equal(panel().hidden, false);
   assert.equal(more.attributes['aria-expanded'], 'true');
   f.update({ ...snapshot, sampledAt: new Date(2000).toISOString() });
+  assert.equal(drawer().open, true);
   assert.equal(panel().hidden, false);
   const [form, actions] = panel().children;
   const input = form.children[0];
@@ -865,7 +1153,7 @@ test('更多面板收纳配对、标签和隐藏，展开后跨刷新保留', as
 });
 
 test('读取会话展开现有摘要，切换收起内容时不重新请求', async () => {
-  const row = panelRow('win-codex', 'fixture-summary');
+  const row = panelRow('win-codex', 'fixture-summary', 'active');
   const snapshot = { maxAutoReads: 5, targets: { [row.target]: panelTarget([row]) }, prefs: { sessions: {} } };
   const f = await panelFixture(snapshot, 'fixture_chat', {
     summary: { messages: [{ role: 'assistant', text: 'Mock summary' }] }
@@ -964,14 +1252,15 @@ test('卡片只在完成、失败或中断且有新回复时追加提示，审�
   assert.equal(badge({ state: 'paused', unread: old }), '暂停');
   assert.equal(badge({ state: 'idle', unread: old }), '空闲');
   for (const [outcome, label] of [['completed', '已完成'], ['failed', '失败'], ['interrupted', '已中断']]) {
-    assert.equal(badge({ state: 'idle', outcome, unread: { kind: outcome } }), label + ' · 新回复');
+    assert.equal(badge({ state: 'idle', outcome, unread: { kind: outcome, at: Date.now() } }), label + ' · 新回复');
     assert.equal(badge({ state: 'idle', outcome, unread: { kind: 'waiting_approval' } }), label);
     assert.equal(badge({ state: 'idle', outcome, unread: null }), label);
   }
 });
 
 test('已读 nudge 只清理匹配的终态轮次，无轮次 ID 时兼容旧记录，审批保留', async t => {
-  const legacy = { target, sessionId: 'legacy-read', workspacePath: '/mock', state: 'idle', unread: { kind: 'completed' } };
+  const legacy = { target, sessionId: 'legacy-read', workspacePath: '/mock', state: 'idle',
+    unread: { kind: 'completed', at: 1_761_000_000_000 } };
   const f = await fixture(t, { 'state.json': { targets: { [target]: { reachable: true, sessions: [legacy] } } } });
   await probe(f);
   f.conclude();

@@ -3,6 +3,7 @@ import test from 'node:test';
 import { DshAdapter } from '../src/adapters/dsh.mjs';
 import { createToolInvoker } from '../src/mcp/server.mjs';
 import { maxWatcherTimeoutMs, validateConfig } from '../src/shared/config.mjs';
+import { runDoctor } from '../src/sidecar/doctor.mjs';
 
 const token = 'dsh-collaboration-fixture-token-not-real';
 const bridgeToken = 'dsh-bridge-fixture-token-not-real';
@@ -73,6 +74,89 @@ function fixture(target, { auth = false, writes, createResponse } = {}) {
     adapter, calls, workspacePath, expectedWorkspace, setState(value) { state = value; tasks[0].running = value !== 'idle'; }
   };
 }
+
+async function doctorFixture(timeouts = {}, errors = {}) {
+  const env = {};
+  const config = validateConfig({ dsh: Object.fromEntries(Object.entries(timeouts).map(([target, requestTimeoutMs]) => [target, {
+    baseUrl: 'https://dsh.example.invalid', id: target + '-fixture', environmentId: 'fixture-environment',
+    token, bridgeToken, requestTimeoutMs
+  }])) }, env);
+  const lines = [];
+  const lists = [];
+  const status = await runDoctor(env, {
+    readConfig: actualEnv => {
+      assert.equal(actualEnv, env);
+      return config;
+    },
+    adapters: {
+      WinCodex: class {
+        constructor(actualConfig, options) {
+          assert.equal(actualConfig, config);
+          assert.equal(options.env, env);
+        }
+        list(limit) { lists.push(['win-codex', limit]); }
+      },
+      RemoteCodex: class {
+        constructor(actualConfig) { assert.equal(actualConfig.remote.requestTimeoutMs, 8000); }
+        list(limit) { lists.push(['101-codex', limit]); }
+      },
+      DshAdapter: class extends DshAdapter {
+        constructor(target, actualConfig) {
+          super(target, actualConfig, { fetch: async (_url, options) => {
+            assert.deepEqual(JSON.parse(options.body), { action: 'list', input: {} });
+            return response({ hostId: target + '-fixture', tasks: [] });
+          } });
+          assert.deepEqual(actualConfig.dsh, { ...config.dsh, [target]: {
+            ...config.dsh[target], requestTimeoutMs: Math.min(8000, timeouts[target])
+          } });
+        }
+        async list(limit) {
+          lists.push([this.target, limit, this.endpoint.requestTimeoutMs]);
+          if (errors[this.target]) throw errors[this.target];
+          return super.list(limit);
+        }
+      }
+    },
+    checkMcp: actualEnv => {
+      assert.equal(actualEnv, env);
+      return 'stdio JSON-RPC fixture';
+    },
+    write: line => lines.push(line)
+  });
+  return { status, lines, lists };
+}
+
+test('doctor 未配置 DSH 时只执行原有四项检查', async () => {
+  const { status, lines, lists } = await doctorFixture();
+  assert.equal(status, 0);
+  assert.deepEqual(lines, [
+    `[通过] Node.js · ${process.versions.node}\n`,
+    '[通过] Windows Codex 管道 · 桌面管道可读\n',
+    '[通过] 101 SSH 与 Codex Socket · desktop-pipe 会话列表可读\n',
+    '[通过] MCP 握手 · stdio JSON-RPC fixture\n'
+  ]);
+  assert.deepEqual(lists, [['win-codex', 1], ['101-codex', 1]]);
+});
+
+test('doctor 只检查已配置的 Windows DSH，并限制请求超时', async () => {
+  const { status, lines, lists } = await doctorFixture({ 'win-dsh': 12_000 });
+  assert.equal(status, 0);
+  assert.deepEqual(lines.slice(4), ['[通过] Windows DSH Bridge · 会话列表可读\n']);
+  assert.deepEqual(lists.slice(2), [['win-dsh', 1, 8000]]);
+});
+
+test('doctor 检查双端 DSH，失败时退出码为 1 并遮盖凭据', async () => {
+  const upstreamCookie = 'fixture-cookie-value';
+  const error = new Error(`DSH 连接失败 ${token} ${bridgeToken} ${cookie}\nCookie: session=${upstreamCookie}`);
+  const { status, lines, lists } = await doctorFixture({ 'win-dsh': 12_000, '101-dsh': 3000 }, { '101-dsh': error });
+  assert.equal(status, 1);
+  assert.equal(lines.length, 6);
+  assert.equal(lines[4], '[通过] Windows DSH Bridge · 会话列表可读\n');
+  assert.match(lines[5], /^\[失败\] 101 DSH Bridge · DSH 连接失败 /);
+  assert.deepEqual(lists.slice(2), [['win-dsh', 1, 8000], ['101-dsh', 1, 3000]]);
+  const output = lines.join('');
+  for (const value of [token, bridgeToken, cookie.split('=')[1], upstreamCookie]) assert.ok(!output.includes(value));
+});
 
 test('DSH Bridge 2.10 在明确 401 后交换 Cookie，并按配置查询与复用登录', async () => {
   const f = fixture('win-dsh', { auth: true });

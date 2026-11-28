@@ -15,10 +15,10 @@ npm test
 
 ## 验收后安装
 
-1. 用 PowerShell 7 执行 `pwsh -File .\scripts\install.ps1`。插件同步到 `%USERPROFILE%\.gemini\config\plugins\agy-native-bridge`，Antigravity 从 `mcp_config.json` 启动 stdio Server，Sidecar 提供「Codex 会话」侧栏看板。
+1. 用 PowerShell 7 执行 `pwsh -File .\scripts\install.ps1`。插件同步到 `%USERPROFILE%\.gemini\config\plugins\agy-native-bridge`，Antigravity 从 `mcp_config.json` 启动 stdio Server，Sidecar 提供「原生会话」侧栏看板。
 2. Windows 本机与 101 均支持免 Hook 自动发现：Windows 直接扫描活动 `\\.\pipe\codex-app-tools-*` 管道与最新 rollout 会话，重载 Antigravity 后即可开箱即用。
 3. **可选（多窗口固定提示）**：若同时开启多个 Codex 桌面窗口并希望按窗口写提示文件，可执行 `pwsh -File .\scripts\install-codex-hook.ps1`（合并用户级 `hooks.json` 并自动备份，用 `-Action Uninstall` 卸载），然后在 Codex 桌面端启用并信任该 Hook 即可写入 `win-codex-pipe.json`（若指向旧管道会自动回退到活动管道）。
-4. 重载 Antigravity 后，可在右侧边栏「Codex 会话」或通过 `bridge_list`、`bridge_status`、`bridge_read` 查看双端会话；真机派发与中断只使用用户指定的专用测试会话。
+4. 重载 Antigravity 后，可在右侧边栏「原生会话」或通过 `bridge_list`、`bridge_status`、`bridge_read` 查看会话。真机派发与中断只使用用户指定的专用测试会话。
 
 Codex 用户级 Hook 的文件路径和信任流程见 [Codex Hooks 文档](https://developers.openai.com/codex/hooks)。
 
@@ -104,13 +104,15 @@ reconcile 只在原生用户消息中查找完全相同的 clientId。历史未�
 
 顶栏铃铛右侧的主题按钮支持跟随系统、深色和浅色，默认跟随系统。主题保存在本机侧栏偏好中，重新打开时先使用本地缓存，随后与 Sidecar 同步。
 
-重载 Antigravity 后，在辅助侧栏打开「Codex 会话」。侧栏监控插件刚派发的任务、`workspaces` 中固定的会话、当前活动会话以及已星标会话（空闲超过 15 分钟仍持续跟踪）。顶部模糊搜索框支持按标题、工作区路径或 `sessionId` 过滤（支持空格多关键词与顺序模糊匹配），搜索时会自动展开 20 条默认上限之后的近期历史会话。
+重载 Antigravity 后，在辅助侧栏打开「原生会话」。侧栏监控刚派发的任务、`workspaces` 中固定的会话、当前活动会话和星标会话。已配置多个目标端时，可通过 Tab 筛选。仅看当前对话时直接展示跨端配对会话。
+
+其他对话的绑定会话默认收入折叠抽屉，待审批会话仍优先展示。每端直接展示 8 条近期会话，可一键绑定、复制引用或展开。其余会话可打开「更多近期会话」查看。顶部支持按标题、工作区路径或 `sessionId` 模糊搜索，能找到超出列表展示上限的会话。
 
 历史目录中未打开加载的会话显示为「未加载」，已派发待核对的任务显示为「待确认」。卡片支持：
 - **星标**：收藏置顶并纳入心跳长期盯梢；
 - **隐藏 / 恢复显示**：纯本地软隐藏（保存在 `prefs.json`），点隐藏后可在该端底部的「已隐藏」抽屉随时点「恢复显示」放回；
 - **复制引用**：左键复制引用 JSON，包含 `target`、`sessionId`、`expectedWorkspace`，有当前轮次时附带 `expectedTurnId`。右键复制自然语言提示词开头，粘贴到对话框后可继续补充需求。
-- **读取会话**：按需拉取最近一轮的公开问答，展开后可点「收起内容」。终态卡片显示「新回复」，查看对应轮次、用 `bridge_read` 读取公开消息或自动读取成功转发后恢复为普通状态标签。审批始终显示「等待原窗口审批」。侧栏支持标题、列表、引用、代码、表格和 HTTP(S) 链接等 Markdown 内容，原始 HTML 按文字显示。
+- **读取会话**：按需拉取最近一轮的公开问答，展开后可点「收起内容」。终态卡片的「新回复」在已读或超过 15 分钟后清除。审批始终显示「等待原窗口审批」。侧栏支持标题、列表、引用、代码、表格和 HTTP(S) 链接等 Markdown 内容，原始 HTML 按文字显示。
 
 心跳空闲时每 5 分钟同步，运行或等待审批时每 30 秒同步，窗口或侧栏激活强制 15 秒防抖，同一台主机连续两次不可达后自动退避到 10 分钟。暂停心跳时仍可手动刷新，桌面通知默认关闭。
 

@@ -86,7 +86,11 @@ export async function connectDesktopPipe(socket, { timeoutMs, tools, label, thre
         const required = listing.tools.find(tool => tool?.name === name)?.inputSchema?.required;
         return tools.has(name) && Array.isArray(required) && required.includes(property);
       },
-      async call(name, args) {
+      supportsInput(name, property) {
+        const properties = listing.tools.find(tool => tool?.name === name)?.inputSchema?.properties;
+        return tools.has(name) && properties != null && typeof properties === 'object' && Object.hasOwn(properties, property);
+      },
+      async call(name, args, options) {
         const tool = tools.has(name) && listing.tools.find(item => item?.name === name && typeof item.namespace === 'string');
         if (!tool) throw new BridgeError('NATIVE_TOOL_UNAVAILABLE', label + ' 未提供此操作。');
         const result = await rpc.request('tools/call', {
@@ -97,7 +101,7 @@ export async function connectDesktopPipe(socket, { timeoutMs, tools, label, thre
           callId: 'agy-bridge-' + randomUUID(),
           turnId: 'agy-bridge-' + randomUUID(),
           arguments: args
-        });
+        }, { timeoutMs: Math.min(timeoutMs, options?.timeoutMs ?? timeoutMs) });
         if (result?.success === false) throw new BridgeError('NATIVE_TOOL_FAILED', label + ' 返回工具调用失败。');
         if (result?.success === true && Array.isArray(result.contentItems)) {
           const text = result.contentItems.filter(i => i?.type === 'inputText').map(i => i.text).join('\n');

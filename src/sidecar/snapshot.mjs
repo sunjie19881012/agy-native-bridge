@@ -40,6 +40,11 @@ export function watchIds(row, fixed, { target, preferences = {} } = {}) {
   ])];
 }
 
+function isUnreadFresh(unread, now) {
+  return unread && (unread.kind === 'waiting_approval'
+    || (Number.isFinite(unread.at) && now - unread.at <= recentUnreadMs));
+}
+
 function mergeSession(prior, current, now, transitions) {
   const latest = current.latestTurn;
   const tracking = prior?.tracking;
@@ -60,7 +65,9 @@ function mergeSession(prior, current, now, transitions) {
     unread = { kind: event, at: now, turnId };
     transitions.push({ target: current.target, sessionId: current.sessionId, kind: event,
       turnId, workspacePath: current.workspacePath, title: current.title });
-  } else if (isBusy) unread = null;
+  } else if (isBusy ? current.state !== 'waiting_approval' : !isUnreadFresh(unread, now)) {
+    unread = null;
+  }
   return {
     ...current, outcome, unread, outcomeAt: finished ? now : isBusy ? null : prior?.outcomeAt ?? null,
     tracking: tracking && !finished
@@ -91,10 +98,13 @@ export function applySamples(state, results, now) {
       return mergeSession(prior, session, now, transitions);
     });
     for (const session of old.values()) {
-      const retained = session.tracking || busy(session.state) || session.unread
+      const unreadFresh = isUnreadFresh(session.unread, now);
+      const retained = session.tracking || busy(session.state) || unreadFresh
         || (session.outcomeAt && now - session.outcomeAt <= recentUnreadMs);
-      if (retained) sessions.push(busy(session.state) && !session.tracking
-        ? { ...session, state: 'unknown', activeTurnId: null } : session);
+      if (!retained) continue;
+      const unread = unreadFresh ? session.unread : null;
+      sessions.push(busy(session.state) && !session.tracking
+        ? { ...session, unread, state: 'unknown', activeTurnId: null } : { ...session, unread });
     }
     targets[target] = {
       reachable: true, failures: 0, retryAt: null, sampledAt, sessions,

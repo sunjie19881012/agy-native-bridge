@@ -98,7 +98,8 @@ function encodeFrame(message) {
   return Buffer.concat([header, body]);
 }
 
-async function fixture(t, { sendBehavior, noSocket, itemPagination, callerThreadId, missingCaller, timeout = 1600 } = {}) {
+async function fixture(t, { sendBehavior, noSocket, itemPagination, callerThreadId, missingCaller, localHistory, quotaTimeout,
+  timeout = 1600 } = {}) {
   const calls = [];
   const relays = [];
   const sockets = new Set();
@@ -136,7 +137,11 @@ async function fixture(t, { sendBehavior, noSocket, itemPagination, callerThread
         let result;
         if (call.method === 'tools/list') {
           assert.deepEqual(call.params, { threadStartKind: 'all' });
-          result = { tools: tools.map(name => ({ name, namespace: 'desktop-fixture' })) };
+          result = { tools: tools.map(name => ({ name, namespace: 'desktop-fixture',
+            ...(name === 'list_threads' && localHistory && { inputSchema: {
+              properties: { mode: {}, source: {}, hostId: {}, archived: {} }
+            } })
+          })) };
         } else {
           assert.equal(call.method, 'tools/call');
           const { tool, namespace, callerSource, threadId, turnId: envelopeTurnId, arguments: args } = call.params;
@@ -169,6 +174,7 @@ async function fixture(t, { sendBehavior, noSocket, itemPagination, callerThread
             data = { threadId: sessionId };
           } else if (tool === 'get_usage_limits') {
             assert.deepEqual(args, {});
+            if (quotaTimeout) return;
             data = { rateLimits: { secondary: { usedPercent: 25 } } };
           } else if (tool === 'list_projects') {
             data = { projects: [{ path: workspace, hostId: 'local', projectId: 'desk-project' }] };
@@ -292,11 +298,27 @@ test('101 A 路心跳用单条 SSH 列出活动会话并读取无正文元数据
   assert.equal(f.relays.length, 1);
   const calls = f.calls.filter(call => call.method === 'tools/call');
   assert.deepEqual(calls.map(call => call.params.tool), ['list_threads', 'read_thread', 'get_usage_limits']);
+  assert.deepEqual(calls[0].params.arguments, { limit: 50 });
   assert.equal(calls[1].params.arguments.turnLimit, 1);
   assert.equal(calls[1].params.arguments.includeOutputs, false);
   assert.equal(calls[1].params.arguments.maxOutputCharsPerItem, 0);
   assert.equal(result.sessions[0].latestTurn.id, turnId);
   assert.doesNotMatch(JSON.stringify(result), /secret-fixture|private reasoning/);
+});
+
+test('101 A 路使用纯本地历史，并把挂起的配额请求限制在 3 秒', { timeout: 6500 }, async t => {
+  const f = await fixture(t, { localHistory: true, quotaTimeout: true, timeout: 8000 });
+  const result = await f.adapter.heartbeat({ sessionIds: [sessionId], includeQuota: true });
+  assert.equal(result.quota, null);
+  assert.equal(result.catalogAvailable, true);
+  assert.deepEqual(result.sessions.map(row => row.sessionId), [sessionId]);
+  assert.deepEqual(result.catalog.map(row => row.sessionId), [sessionId]);
+  assert.equal(f.relays.length, 1);
+  const calls = f.calls.filter(call => call.method === 'tools/call');
+  assert.deepEqual(calls.map(call => call.params.tool), ['list_threads', 'read_thread', 'get_usage_limits']);
+  assert.deepEqual(calls[0].params.arguments, { mode: 'history', source: 'codex', hostId: 'local', archived: false, limit: 50 });
+  assert.equal(Object.hasOwn(calls.at(-1).params, 'timeoutMs'), false);
+  assert.equal(Object.hasOwn(calls.at(-1).params, 'optional'), false);
 });
 
 test('101 桌面管道读完同轮次的消息续页，再读取更早轮次', { timeout: 8000 }, async t => {

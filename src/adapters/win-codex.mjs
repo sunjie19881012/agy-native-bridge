@@ -24,8 +24,26 @@ export async function discoverWinPipes(io = fs, platform = process.platform) {
   } catch { return []; }
 }
 
+async function isSubagentRollout(filePath, io) {
+  try {
+    let prefix;
+    if (typeof io.open === 'function') {
+      const file = await io.open(filePath, 'r');
+      try {
+        const buffer = Buffer.alloc(4096);
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+        prefix = buffer.toString('utf8', 0, bytesRead);
+      } finally { await file.close(); }
+    } else {
+      prefix = String(await io.readFile(filePath, 'utf8'));
+    }
+    const firstLine = JSON.parse(prefix.split('\n', 1)[0]);
+    return firstLine?.type === 'session_meta' && Boolean(firstLine.payload?.source?.subagent);
+  } catch { return false; }
+}
+
 export async function discoverWinCallerThread(sessionsRoot, io = fs) {
-  let newest = null;
+  const candidates = [];
   async function scan(directory, depth) {
     const entries = await io.readdir(directory, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
@@ -39,14 +57,21 @@ export async function discoverWinCallerThread(sessionsRoot, io = fs) {
       const match = isFile && rolloutName.exec(name);
       if (!match) continue;
       const info = await io.lstat(filePath).catch(() => null);
-      if (info?.isFile?.() && (!newest || info.mtimeMs > newest.mtime
-          || (info.mtimeMs === newest.mtime && filePath > newest.path))) {
-        newest = { id: match[1], path: filePath, mtime: info.mtimeMs };
+      if (info?.isFile?.()) {
+        candidates.push({ id: match[1], path: filePath, mtime: info.mtimeMs });
       }
     }
   }
   if (sessionsRoot) await scan(sessionsRoot, 0);
-  return newest?.id ?? null;
+  candidates.sort((a, b) => {
+    if (a.mtime !== b.mtime) return b.mtime - a.mtime;
+    if (a.path === b.path) return 0;
+    return a.path > b.path ? -1 : 1;
+  });
+  for (const candidate of candidates) {
+    if (!await isSubagentRollout(candidate.path, io)) return candidate.id;
+  }
+  return candidates[0]?.id ?? null;
 }
 
 async function readPipeBinding(env, io) {
@@ -126,17 +151,21 @@ export class WinCodex extends DesktopCodex {
       let client;
       let wrote = false;
       let transportError = null;
+      const optionalErrors = new Set();
       try {
         client = await connectPipe(candidate, attemptTimeout, createSocket);
         const tracked = {
           close: () => client.close(),
           requiresInput: (...args) => client.requiresInput(...args),
-          call: async (name, args) => {
+          supportsInput: (...args) => client.supportsInput(...args),
+          call: async (name, args, options) => {
             if (writeTools.has(name)) wrote = true;
             try {
-              return await client.call(name, args);
+              return await client.call(name, args, options);
             } catch (error) {
-              if (!wrote && hasFallback && retryPipeCodes.has(error.code)) {
+              if (options?.optional === true || name === 'get_usage_limits') {
+                optionalErrors.add(error);
+              } else if (!wrote && hasFallback && retryPipeCodes.has(error.code)) {
                 transportError = error;
                 client.close();
               }
@@ -151,7 +180,7 @@ export class WinCodex extends DesktopCodex {
         return result;
       } catch (error) {
         lastError = error;
-        if (wrote || !retryPipeCodes.has(error.code)) throw error;
+        if (wrote || optionalErrors.has(error) || !retryPipeCodes.has(error.code)) throw error;
         if (this.lastHealthyEndpoint === candidate.endpoint) this.lastHealthyEndpoint = null;
         this.unhealthyUntil.set(candidate.endpoint, this.clock() + unhealthyCooldownMs);
       } finally {

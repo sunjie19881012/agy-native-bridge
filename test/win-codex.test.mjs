@@ -13,6 +13,7 @@ const sessionId = '0b1e482a-4efa-401a-9e5c-734dcfba5b63';
 const turnId = '73315155-2455-475a-aadd-dcd9bfa34984';
 const workspace = 'C:\\Mock\\Workspace';
 const user = (id, text) => ({ id, type: 'userMessage', content: [{ type: 'text', text }] });
+const localHistory = { mode: 'history', source: 'codex', hostId: 'local', archived: false, limit: 50 };
 
 function frame(message) {
   const body = Buffer.from(JSON.stringify(message));
@@ -34,11 +35,12 @@ function connectMockPipe(server) {
     : net.createConnection({ host: '127.0.0.1', port: address.port });
 }
 
-async function fixture(t, extra = {}) {
+async function fixture(t, { listInputs, historyFailure, quotaTimeout, discover, requestTimeoutMs = 1500, ...extra } = {}) {
   const endpoint = '\\\\.\\pipe\\codex-app-tools-' + randomUUID();
   const callerThreadId = randomUUID();
   const sockets = new Set();
   const calls = [];
+  const attempts = [];
   let thread = { id: sessionId, title: '模拟会话', cwd: workspace, hostId: 'local', status: { type: 'idle' } };
   let turns = [{ id: turnId, status: 'completed', items: [user('input', '问题')] }];
   let sendReply = { threadId: sessionId };
@@ -55,10 +57,14 @@ async function fixture(t, extra = {}) {
         buffer = buffer.subarray(end);
         calls.push(request);
         let result;
+        let error;
         if (request.method === 'tools/list') {
           result = { tools: ['list_threads', 'read_thread', 'send_message_to_thread', 'get_usage_limits',
             'list_projects', 'create_thread', 'set_thread_title'].map(name => ({
-            name, namespace: 'fixture', ...(name === 'create_thread' && { inputSchema: { required: ['prompt'] } })
+            name, namespace: 'fixture', ...(name === 'create_thread' && { inputSchema: { required: ['prompt'] } }),
+            ...(name === 'list_threads' && listInputs && { inputSchema: {
+              properties: Object.fromEntries(listInputs.map(property => [property, {}]))
+            } })
           })) };
         } else {
           assert.equal(request.params.threadId, callerThreadId);
@@ -67,20 +73,27 @@ async function fixture(t, extra = {}) {
           assert.equal(typeof request.params.callId, 'string');
           const { tool, arguments: args } = request.params;
           let data;
-          if (tool === 'list_threads') data = { pinnedThreads: [thread], threads: [thread, { ...thread, id: 'remote', hostId: 'other-host' }] };
-          else if (tool === 'read_thread') {
+          if (tool === 'list_threads') {
+            if (args.mode === 'history' && historyFailure === 'timeout') return;
+            if (args.mode === 'history' && historyFailure === 'rejected') error = { code: -32602, message: 'fixture rejected history' };
+            if (args.mode === 'history' && historyFailure === 'failed') result = { success: false };
+            data = { pinnedThreads: [thread], threads: [thread, { ...thread, id: 'remote', hostId: 'other-host' }] };
+          } else if (tool === 'read_thread') {
             assert.equal(args.includeOutputs, false);
             assert.equal(args.turnLimit, 1);
             data = { thread, turns, page: { order: 'newest_first' } };
           } else if (tool === 'send_message_to_thread') data = sendReply;
-          else if (tool === 'get_usage_limits') data = { rateLimits: { primary: { usedPercent: 25 } } };
+          else if (tool === 'get_usage_limits') {
+            if (quotaTimeout) return;
+            data = { rateLimits: { primary: { usedPercent: 25 } } };
+          }
           else if (tool === 'list_projects') data = { projects: [{ projectId: 'project', path: workspace, hostId: 'local' }] };
           else if (tool === 'create_thread') data = { threadId: sessionId, hostId: 'local' };
           else assert.fail('unexpected desktop tool ' + tool);
           if (data === 'disconnect') { socket.destroy(); return; }
-          result = { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(data) }] };
+          result ??= { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(data) }] };
         }
-        const response = frame({ jsonrpc: '2.0', id: request.id, result });
+        const response = frame({ jsonrpc: '2.0', id: request.id, ...(error ? { error } : { result }) });
         socket.write(response.subarray(0, 2));
         setImmediate(() => { if (!socket.destroyed) socket.write(response.subarray(2)); });
       }
@@ -93,12 +106,20 @@ async function fixture(t, extra = {}) {
     for (const socket of sockets) socket.destroy();
     await new Promise(resolve => server.close(resolve));
   });
+  const binding = { endpoint, callerThreadId };
+  const pipeNames = [path.win32.basename(endpoint), 'codex-app-tools-' + randomUUID()];
+  const discovery = discover ? {
+    platform: 'win32',
+    io: {
+      readFile: async () => JSON.stringify(binding),
+      readdir: async () => pipeNames
+    }
+  } : { binding: async () => binding };
   return {
-    calls,
-    adapter: new WinCodex(validateConfig({ win: { requestTimeoutMs: 1500 } }), {
-      binding: async () => ({ endpoint, callerThreadId }),
-      createSocket: () => process.platform === 'win32' ? net.createConnection(endpoint)
-        : net.createConnection({ host: '127.0.0.1', port: server.address().port }),
+    calls, attempts, endpoint,
+    adapter: new WinCodex(validateConfig({ win: { requestTimeoutMs } }), {
+      ...discovery,
+      createSocket: candidate => { attempts.push(candidate); return connectMockPipe(server); },
       ...extra
     }),
     setThread: value => { thread = { ...thread, ...value }; },
@@ -106,6 +127,48 @@ async function fixture(t, extra = {}) {
     setSendReply: value => { sendReply = value; }
   };
 }
+
+test('Windows 桌面按工具 schema 请求纯本地历史，旧 schema 和缺失的可选参数保持兼容', async t => {
+  const inputs = ['mode', 'source', 'hostId', 'archived'];
+  for (const [listInputs, expected] of [
+    [inputs, localHistory],
+    [inputs.slice(0, 3), { mode: 'history', source: 'codex', hostId: 'local', limit: 50 }],
+    [['source', 'hostId', 'archived'], { limit: 50 }]
+  ]) {
+    const f = await fixture(t, { listInputs, discover: true });
+    assert.deepEqual((await f.adapter.list(60)).map(row => row.sessionId), [sessionId]);
+    assert.deepEqual(f.calls.filter(call => call.params.tool === 'list_threads').map(call => call.params.arguments), [expected]);
+  }
+});
+
+test('本地历史仅在原生拒绝或工具失败时回退一次，超时不重查默认模式', async t => {
+  for (const historyFailure of ['rejected', 'failed', 'timeout']) {
+    const f = await fixture(t, { listInputs: ['mode', 'source', 'hostId', 'archived'], historyFailure, requestTimeoutMs: 200 });
+    if (historyFailure === 'timeout') await assert.rejects(f.adapter.list(50), { code: 'NATIVE_TIMEOUT' });
+    else assert.equal((await f.adapter.list(50)).length, 1);
+    const expected = historyFailure === 'timeout' ? [localHistory] : [localHistory, { limit: 50 }];
+    assert.deepEqual(f.calls.filter(call => call.params.tool === 'list_threads').map(call => call.params.arguments), expected);
+  }
+});
+
+test('Windows 可选额度超时保留心跳和健康端点，同条连接仍可读取', { timeout: 2500 }, async t => {
+  const f = await fixture(t, { quotaTimeout: true, discover: true, requestTimeoutMs: 200 });
+  const result = await f.adapter.heartbeat({ sessionIds: [sessionId], includeQuota: true });
+  assert.equal(result.quota, null);
+  assert.deepEqual(result.sessions.map(row => row.sessionId), [sessionId]);
+  assert.deepEqual(result.catalog.map(row => row.sessionId), [sessionId]);
+  assert.deepEqual(f.attempts, [f.endpoint]);
+  assert.equal(f.adapter.lastHealthyEndpoint, f.endpoint);
+  assert.equal(f.adapter.unhealthyUntil.size, 0);
+
+  await f.adapter.withPipe(async client => {
+    await assert.rejects(client.call('get_usage_limits', {}, { timeoutMs: 100 }), { code: 'NATIVE_TIMEOUT' });
+    assert.ok((await client.call('list_threads', { limit: 1 })).threads.length);
+  });
+  await assert.rejects(f.adapter.withPipe(client => client.call('get_usage_limits', {})), { code: 'NATIVE_TIMEOUT' });
+  assert.deepEqual(f.attempts, [f.endpoint, f.endpoint, f.endpoint]);
+  assert.equal(f.adapter.unhealthyUntil.size, 0);
+});
 
 test('Windows 管道白名单支持只读额度查询', async t => {
   const f = await fixture(t);
@@ -236,6 +299,56 @@ test('Windows 读取公开消息并增量补齐匹配会话和已完成轮次的
   assert.deepEqual(r.starts, [0, firstOffset, firstOffset + multibyte]);
   assert.equal(await r.read(sessionId, 'C:\\Wrong', turnId), null);
   assert.equal(await r.read(sessionId, workspace, randomUUID()), null);
+});
+
+test('Windows 调用会话发现限量读取首条元数据，跳过子代理并按时间与路径排序', async () => {
+  const sessionsRoot = path.resolve('test', 'virtual-win-sessions');
+  const latest = randomUUID();
+  const regular = randomUUID();
+  const other = randomUUID();
+  const guardian = 'rollout-guardian-' + latest + '.jsonl';
+  const regularFile = 'rollout-z-main-' + regular + '.jsonl';
+  const otherFile = 'rollout-a-main-' + other + '.jsonl';
+  const firstLine = source => JSON.stringify({ type: 'session_meta', payload: { source } }) + '\r\n';
+  const guardianMeta = firstLine({ subagent: { guardian: {} } });
+  const sources = new Map([[guardian, guardianMeta], [regularFile, firstLine('vscode')], [otherFile, firstLine('cli')]]);
+  const closed = [];
+  const list = {
+    readdir: async () => [otherFile, guardian, regularFile],
+    lstat: async file => ({ isFile: () => true, mtimeMs: path.basename(file) === guardian ? 300 : 200 })
+  };
+  const discovered = await discoverWinCallerThread(sessionsRoot, {
+    ...list,
+    async open(file, flag) {
+      assert.equal(flag, 'r');
+      const name = path.basename(file);
+      return {
+        async read(buffer, offset, length, position) {
+          assert.deepEqual([offset, length, position], [0, 4096, 0]);
+          const bytesRead = Buffer.from(sources.get(name) + 'x'.repeat(5000)).copy(buffer, offset, 0, length);
+          return { bytesRead };
+        },
+        async close() { closed.push(name); }
+      };
+    },
+    readFile: async () => assert.fail('open is available')
+  });
+  assert.equal(discovered, regular);
+  assert.deepEqual(closed, [guardian, regularFile]);
+
+  const selected = source => discoverWinCallerThread(sessionsRoot, {
+    ...list,
+    readFile: async (file, encoding) => {
+      assert.equal(encoding, 'utf8');
+      return source(path.basename(file));
+    }
+  });
+  assert.equal(await selected(() => guardianMeta), latest);
+  assert.equal(await selected(name => name === guardian ? guardianMeta : '{invalid fixture JSON'), regular);
+  assert.equal(await selected(name => {
+    if (name === guardian) throw new Error('fixture unreadable');
+    return firstLine('cli');
+  }), latest);
 });
 
 test('Windows 缺失发现文件时自动扫描桌面管道与最新 rollout 会话并连上通信', async t => {

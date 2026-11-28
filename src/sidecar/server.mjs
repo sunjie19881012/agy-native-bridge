@@ -53,7 +53,7 @@ function notifyWindows(events) {
     'Add-Type -AssemblyName System.Windows.Forms, System.Drawing',
     '$notice=[System.Windows.Forms.NotifyIcon]::new()',
     'try { $notice.Icon=[System.Drawing.SystemIcons]::Information; $notice.Visible=$true',
-    '$notice.ShowBalloonTip(4500, "Codex 会话", $env:AGY_BRIDGE_NOTIFICATION, "Info")',
+    '$notice.ShowBalloonTip(4500, "原生会话", $env:AGY_BRIDGE_NOTIFICATION, "Info")',
     'Start-Sleep -Seconds 5 } finally { $notice.Dispose() }'
   ].join('; ');
   const child = spawn('pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
@@ -166,11 +166,14 @@ export async function startSidecar({
   }
 
   function nudgeConversation(body) {
-    if (validHostId(body.conversationId)) return { conversationId: body.conversationId, projectId: body.projectId };
+    if (validHostId(body.conversationId)) {
+      return { conversationId: body.conversationId, projectId: body.projectId, explicit: true };
+    }
     const age = activeConversation ? clock() - activeConversation.at : Infinity;
-    if (age >= 0 && age < activeConversationMs) return { conversationId: activeConversation.id };
+    if (age >= 0 && age < activeConversationMs) return { conversationId: activeConversation.id, explicit: false };
     return validHostId(env.ANTIGRAVITY_CONVERSATION_ID)
-      ? { conversationId: env.ANTIGRAVITY_CONVERSATION_ID, projectId: env.ANTIGRAVITY_PROJECT_ID } : {};
+      ? { conversationId: env.ANTIGRAVITY_CONVERSATION_ID, projectId: env.ANTIGRAVITY_PROJECT_ID, explicit: false }
+      : { explicit: false };
   }
   function fillPairTitle(key, conversationId) {
     if (!conversationId || closing) return;
@@ -264,8 +267,10 @@ export async function startSidecar({
       }
       const fromUi = (request.method === 'GET' && ['/api/state', '/api/summary'].includes(url.pathname))
         || (request.method === 'POST' && ['/api/refresh', '/api/prefs'].includes(url.pathname));
+      const backgroundPoll = request.method === 'GET' && url.pathname === '/api/state'
+        && request.headers['x-agy-background-poll'] === '1';
       const uiConversationId = request.headers['x-agy-conversation-id'];
-      if (fromUi && validHostId(uiConversationId)) activeConversation = { id: uiConversationId, at: clock() };
+      if (fromUi && !backgroundPoll && validHostId(uiConversationId)) activeConversation = { id: uiConversationId, at: clock() };
       if (request.method === 'GET' && url.pathname === '/api/state') return answer(200, view());
       if (request.method === 'GET' && url.pathname === '/api/summary') {
         const target = url.searchParams.get('target');
@@ -363,19 +368,30 @@ export async function startSidecar({
           return answer(202, { ok: true });
         }
         let missingConversation = false;
-        if ((body.action === 'send' || body.action === 'create') && (destination.conversationId || body.autoReadOnFinish === true)) {
-          const pairId = destination.conversationId;
+        if (body.action === 'send' || body.action === 'create') {
+          let pairId;
           await updatePreference(key, prior => {
+            const paired = validHostId(prior.pairedConversationId);
+            let recipient = destination;
+            if (!destination.explicit && paired) {
+              recipient = {
+                conversationId: prior.pairedConversationId,
+                projectId: prior.lastDispatchConversationId === prior.pairedConversationId ? prior.lastDispatchProjectId : undefined
+              };
+            } else if (!destination.explicit && prior.autoRead === true && validHostId(prior.autoReadConversationId)) {
+              recipient = { conversationId: prior.autoReadConversationId, projectId: prior.autoReadProjectId };
+            }
+            if (destination.explicit || !paired) pairId = recipient.conversationId;
             let next = pairId ? { ...prior, lastDispatchConversationId: pairId,
-              lastDispatchProjectId: validHostId(destination.projectId) ? destination.projectId : null } : prior;
-            if (body.action === 'send' && body.autoReadOnFinish === true && !next.autoRead && !next.autoReadLimitReached) {
-              const binding = findBinding(destination, next, env);
+              lastDispatchProjectId: validHostId(recipient.projectId) ? recipient.projectId : null } : prior;
+            if (body.action === 'send' && body.autoReadOnFinish === true && !prior.autoRead && !prior.autoReadLimitReached) {
+              const binding = findBinding(recipient, next, env);
               missingConversation = !binding;
               next = binding ? enableAutoRead(next, binding) : { ...next, autoReadError: missingBinding };
             }
             return pairId ? pairConversation(next, pairId, clock()) : next;
           });
-          fillPairTitle(key, pairId);
+          if (pairId) fillPairTitle(key, pairId);
         }
         if (body.action === 'send' || (body.action === 'create' && body.tracking === true)) {
           await commit(recordDispatch(state, body, clock()));

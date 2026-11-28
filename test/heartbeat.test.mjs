@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createHeartbeat, heartbeatMs, intervalFor } from '../src/sidecar/heartbeat.mjs';
+import { createHeartbeat, heartbeatMs, intervalFor, recentUnreadMs } from '../src/sidecar/heartbeat.mjs';
 import { applySamples, initialSnapshot, recordDispatch, watchIds } from '../src/sidecar/snapshot.mjs';
 
 function timeline() {
@@ -172,6 +172,35 @@ test('快照跟踪派发前后轮次、审批和完成未读，额度只保存 C
   assert.equal(update('idle', 'next', 'failed').row.unread.kind, 'failed');
   update('active', 'last', 'inProgress');
   assert.equal(update('idle', 'last', 'interrupted').row.unread.kind, 'interrupted');
+});
+
+test('过期终态未读会从快照清掉，仍被探测的会话清除未读，待审批保持未读', () => {
+  const target = '101-codex';
+  const at = 10_000;
+  const terminal = (sessionId, kind, extra) => ({
+    target, sessionId, state: 'idle', outcome: kind, outcomeAt: at, unread: { kind, at }, ...extra
+  });
+  const ongoingApproval = { target, sessionId: 'approval', state: 'waiting_approval',
+    unread: { kind: 'waiting_approval', at, turnId: 'turn' } };
+  const tracked = terminal('tracked', 'interrupted', { tracking: { turnId: 'next' } });
+  const sampled = terminal('sampled', 'failed');
+  const sessions = [terminal('completed', 'completed'), terminal('failed', 'failed'), terminal('interrupted', 'interrupted'),
+    terminal('missing-time', 'completed', { unread: { kind: 'completed' } }), tracked, sampled, ongoingApproval];
+  const state = initialSnapshot({ targets: { [target]: { sessions } } });
+  const snapshotAt = now => applySamples(state, [[target, { sessions: [
+    { target, sessionId: sampled.sessionId, state: 'idle' }, { target, sessionId: ongoingApproval.sessionId, state: 'waiting_approval' }
+  ], catalog: sessions }]], now);
+  const boundary = snapshotAt(at + recentUnreadMs).state.targets[target].sessions;
+  assert.equal(boundary.find(row => row.sessionId === 'completed').unread.kind, 'completed');
+  assert.equal(boundary.find(row => row.sessionId === 'missing-time').unread, null);
+  const expired = snapshotAt(at + recentUnreadMs + 1);
+  assert.deepEqual(expired.transitions, []);
+  assert.deepEqual(expired.state.targets[target].sessions.map(row => [row.sessionId, row.unread]), [
+    ['sampled', null], ['approval', ongoingApproval.unread], ['tracked', null]
+  ]);
+  const missingApproval = applySamples(expired.state, [[target, { sessions: [], catalog: [] }]], at + 2 * recentUnreadMs);
+  assert.deepEqual(missingApproval.state.targets[target].sessions.find(row => row.sessionId === 'approval').unread,
+    ongoingApproval.unread);
 });
 
 test('记录新派发或跟踪新建首轮时清除旧回复，空会话新建保持快照', () => {

@@ -55,7 +55,21 @@ export class DesktopCodex {
   }
 
   async listViews(client, limit) {
-    const listing = await client.call('list_threads', { limit: Math.min(limit, 50) });
+    const args = { limit: Math.min(limit, 50) };
+    const supports = property => client.supportsInput?.('list_threads', property);
+    let listing;
+    if (supports('mode') && supports('source') && supports('hostId')) {
+      try {
+        listing = await client.call('list_threads', {
+          mode: 'history', source: 'codex', hostId: 'local', ...(supports('archived') && { archived: false }), ...args
+        });
+      } catch (error) {
+        if (error.code !== 'NATIVE_REJECTED' && error.code !== 'NATIVE_TOOL_FAILED') throw error;
+        listing = await client.call('list_threads', args);
+      }
+    } else {
+      listing = await client.call('list_threads', args);
+    }
     if (!Array.isArray(listing?.threads) || (listing.pinnedThreads !== undefined && !Array.isArray(listing.pinnedThreads))) {
       throw new BridgeError('INVALID_NATIVE_RESPONSE', this.label + ' 会话列表格式有误。');
     }
@@ -107,7 +121,7 @@ export class DesktopCodex {
         }
       }
       if (listingError && sessions.length === 0) throw listingError;
-      const quota = includeQuota ? await client.call('get_usage_limits', {}).catch(() => null) : null;
+      const quota = includeQuota ? await client.call('get_usage_limits', {}, { timeoutMs: 3_000, optional: true }).catch(() => null) : null;
       return { sessions, catalog: [...catalog.values()], catalogAvailable: !listingError, quota };
     });
   }

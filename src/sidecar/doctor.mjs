@@ -1,8 +1,11 @@
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { DshAdapter } from '../adapters/dsh.mjs';
 import { RemoteCodex } from '../adapters/remote-codex.mjs';
 import { WinCodex } from '../adapters/win-codex.mjs';
 import { readConfig } from '../shared/config.mjs';
+import { redact } from '../shared/conversation.mjs';
+import { dshTargets, windowsTarget } from '../shared/targets.mjs';
 
 const mcpPath = fileURLToPath(new URL('../mcp/server.mjs', import.meta.url));
 
@@ -26,8 +29,23 @@ export function checkMcp(env = process.env) {
   return 'stdio JSON-RPC ' + version;
 }
 
-async function runDoctor(env) {
-  const config = await readConfig(env);
+function dshErrorMessage(error, { token, bridgeToken }) {
+  let message = typeof error?.message === 'string' ? error.message : '无法读取会话列表。';
+  const credentials = [token, bridgeToken].filter(Boolean).sort((a, b) => b.length - a.length);
+  for (const credential of credentials) message = message.replaceAll(credential, '[已遮盖]');
+  return redact(message
+    .replace(/\b((?:set-)?cookie|x-collab-token)\s*:[^\r\n]*/gi, '$1: [已遮盖]')
+    .replace(/\bdsh_bridge_auth=[^;\s,]+/gi, 'dsh_bridge_auth=[已遮盖]'))
+    .replace(/[\x00-\x1f\x7f]/g, ' ');
+}
+
+export async function runDoctor(env = process.env, {
+  readConfig: loadConfig = readConfig,
+  adapters = { WinCodex, RemoteCodex, DshAdapter },
+  checkMcp: handshake = checkMcp,
+  write = line => process.stdout.write(line)
+} = {}) {
+  const config = await loadConfig(env);
   const checks = [
     ['Node.js', async () => {
       const [major, minor] = process.versions.node.split('.').map(Number);
@@ -35,25 +53,35 @@ async function runDoctor(env) {
       return process.versions.node;
     }],
     ['Windows Codex 管道', async () => {
-      await new WinCodex(config, { env }).list(1);
+      await new adapters.WinCodex(config, { env }).list(1);
       return '桌面管道可读';
     }],
     ['101 SSH 与 Codex Socket', async () => {
       const remote = { ...config.remote, requestTimeoutMs: Math.min(8000, config.remote.requestTimeoutMs) };
-      await new RemoteCodex({ ...config, remote }).list(1);
+      await new adapters.RemoteCodex({ ...config, remote }).list(1);
       return remote.transport + ' 会话列表可读';
     }],
-    ['MCP 握手', async () => checkMcp(env)]
+    ['MCP 握手', async () => handshake(env)]
   ];
-  let failed = false;
-  for (const [label, check] of checks) {
-    try { process.stdout.write('[通过] ' + label + ' · ' + await check() + '\n'); }
-    catch (error) { failed = true; process.stdout.write('[失败] ' + label + ' · ' + error.message + '\n'); }
+  for (const target of dshTargets) {
+    const endpoint = config.dsh?.[target];
+    if (!endpoint) continue;
+    const label = windowsTarget(target) ? 'Windows DSH Bridge' : '101 DSH Bridge';
+    checks.push([label, async () => {
+      const dsh = { ...config.dsh, [target]: { ...endpoint, requestTimeoutMs: Math.min(8000, endpoint.requestTimeoutMs) } };
+      await new adapters.DshAdapter(target, { ...config, dsh }).list(1);
+      return '会话列表可读';
+    }, error => dshErrorMessage(error, endpoint)]);
   }
-  if (failed) process.exitCode = 1;
+  let failed = false;
+  for (const [label, check, formatError = error => error.message] of checks) {
+    try { write('[通过] ' + label + ' · ' + await check() + '\n'); }
+    catch (error) { failed = true; write('[失败] ' + label + ' · ' + formatError(error) + '\n'); }
+  }
+  return failed ? 1 : 0;
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  try { await runDoctor(process.env); }
+  try { if (await runDoctor()) process.exitCode = 1; }
   catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 1; }
 }

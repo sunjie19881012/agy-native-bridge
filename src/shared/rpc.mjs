@@ -35,14 +35,14 @@ export function nativeRpc(send, timeoutMs, onEvent = () => {}) {
         request.resolve(message.result);
       }
     },
-    request(method, params) {
+    request(method, params, options) {
       if (closed) return Promise.reject(new BridgeError('NATIVE_DISCONNECTED', '原生连接已断开。'));
       const id = ++sequence;
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
           reject(new BridgeError('NATIVE_TIMEOUT', '等待原生接口回执超时。'));
-        }, timeoutMs);
+        }, options?.timeoutMs ?? timeoutMs);
         pending.set(id, { timer, resolve, reject });
         try {
           send({ jsonrpc: '2.0', id, method, params }, error => { if (error) disconnect(); });
